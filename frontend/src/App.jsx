@@ -108,6 +108,7 @@ export default function App() {
   const [marketTrades, setMarketTrades] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [windowDays, setWindowDays] = useState(30);
+  const [hideWhales, setHideWhales] = useState(true);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
@@ -134,6 +135,9 @@ export default function App() {
     }
     params.set('limit', '50');
     params.set('days', String(days));
+    if (hideWhales) {
+      params.set('hide_whales', 'true');
+    }
     const data = await fetchJson(`${API_BASE}/markets?${params.toString()}`);
     setMarkets(data.markets || []);
     if (selectedMarketId && !(data.markets || []).some((m) => m.id === selectedMarketId)) {
@@ -195,6 +199,12 @@ export default function App() {
   }, [selectedCategory]);
 
   useEffect(() => {
+    if (!loading) {
+      loadMarkets(selectedCategory).catch((err) => setError(err.message));
+    }
+  }, [hideWhales]);
+
+  useEffect(() => {
     if (selectedMarketId) {
       loadMarketDetail(selectedMarketId).catch((err) => setError(err.message));
     }
@@ -218,11 +228,11 @@ export default function App() {
 
   const topRetailShare = useMemo(() => {
     if (!categories.length) return 0;
-    return Math.max(
-      ...categories.map((category) => (
-        category.retail_volume_share ?? category.retail_trade_share ?? 0
-      ))
-    );
+    const shares = categories
+      .map((category) => (category.retail_volume_share ?? category.retail_trade_share))
+      .filter((value) => typeof value === 'number');
+    if (!shares.length) return 0;
+    return Math.max(...shares);
   }, [categories]);
 
   const categoryCoverageHint = useMemo(() => {
@@ -235,6 +245,7 @@ export default function App() {
     if (!markets.length) return [];
     const term = searchTerm.trim().toLowerCase();
     return markets.filter((market) => {
+      if (hideWhales && market.retail_signals?.whale_dominated) return false;
       if (!term) return true;
       return (
         market.title?.toLowerCase().includes(term) ||
@@ -283,6 +294,39 @@ export default function App() {
     return `Confidence: ${label}`;
   }, [marketDetail]);
 
+  const qualityNote = useMemo(() => {
+    const signals = marketDetail?.retail_signals;
+    if (!signals || signals.quality_ok !== false) return '';
+    if (signals.quality_reason === 'low_volume') return 'Low volume market; expect noisy signals.';
+    if (signals.quality_reason === 'low_liquidity') return 'Low liquidity market; price impact is noisy.';
+    if (signals.quality_reason === 'low_volume_and_liquidity') {
+      return 'Low volume and liquidity; signals are unreliable.';
+    }
+    return 'Market quality below threshold.';
+  }, [marketDetail]);
+
+  const flowAttention = useMemo(() => {
+    const flow = marketDetail?.retail_signals?.flow_score ?? 0;
+    const attention = marketDetail?.retail_signals?.attention_score ?? 0;
+    let label = 'Low signal';
+    if (flow >= 0.6 && attention >= 0.6) label = 'Hot retail + hype';
+    else if (flow >= 0.6) label = 'Steady retail flow';
+    else if (attention >= 0.6) label = 'Hype burst';
+    return { flow, attention, label };
+  }, [marketDetail]);
+
+  const whaleNote = useMemo(() => {
+    const whaleShare = marketDetail?.retail_signals?.whale_share;
+    if (whaleShare === null || whaleShare === undefined) return '';
+    if (whaleShare < 0.5) return '';
+    return `Whale dominated (${formatPercent(whaleShare)} of volume)`;
+  }, [marketDetail]);
+
+  const selectedMarketRow = useMemo(() => {
+    if (!selectedMarketId) return null;
+    return markets.find((market) => market.id === selectedMarketId) || null;
+  }, [markets, selectedMarketId]);
+
   if (loading) {
     return (
       <div className="app-shell">
@@ -325,6 +369,25 @@ export default function App() {
                   {days}d
                 </button>
               ))}
+            </div>
+          </div>
+          <div className="window-toggle">
+            <span className="toggle-label">Whales</span>
+            <div className="toggle-group">
+              <button
+                className={`toggle-btn ${hideWhales ? 'active' : ''}`}
+                onClick={() => setHideWhales(true)}
+                type="button"
+              >
+                Hide
+              </button>
+              <button
+                className={`toggle-btn ${!hideWhales ? 'active' : ''}`}
+                onClick={() => setHideWhales(false)}
+                type="button"
+              >
+                Show
+              </button>
             </div>
           </div>
           <div className="timestamp">
@@ -468,6 +531,12 @@ export default function App() {
                     <span>{market.category}</span>
                     <span>•</span>
                     <span>{formatTimestamp(market.last_updated)}</span>
+                    <span>•</span>
+                    <span>
+                      {market.last_trade_time
+                        ? `Last trade ${formatTimestamp(market.last_trade_time)}`
+                        : 'No recent trades'}
+                    </span>
                   </div>
                 </div>
                 <div className="market-stats">
@@ -478,6 +547,14 @@ export default function App() {
                   <div>
                     <p>Avg trade</p>
                     <strong>{formatCurrency(market.avg_trade_size_window)}</strong>
+                  </div>
+                  <div>
+                    <p>Cat z</p>
+                    <strong>
+                      {typeof market.retail_score_z === 'number'
+                        ? market.retail_score_z.toFixed(2)
+                        : '--'}
+                    </strong>
                   </div>
                   <div className={`signal-pill ${retailStatus.level}`}>
                     {retailStatus.label}
@@ -516,6 +593,10 @@ export default function App() {
                   <p>Lifecycle</p>
                   <strong>{marketDetail.lifecycle.stage}</strong>
                   <span className="hint">Growth {marketDetail.lifecycle.growth_rate?.toFixed(2)}x</span>
+                  <span className="hint">Confidence {marketDetail.lifecycle.confidence?.toFixed(2)}</span>
+                  {typeof selectedMarketRow?.retail_score_z === 'number' && (
+                    <span className="hint">Category z {selectedMarketRow.retail_score_z.toFixed(2)}</span>
+                  )}
                   <span className={`coverage-pill ${marketDetail.retail_signals.coverage || 'snapshot'}`}>
                     {formatCoverageLabel(
                       marketDetail.retail_signals.coverage,
@@ -543,10 +624,24 @@ export default function App() {
                   <p>Avg trade</p>
                   <strong>{formatCurrency(marketDetail.latest.avg_trade_size_window)}</strong>
                 </div>
+                <div>
+                  <p>Last trade</p>
+                  <strong>{formatTimestamp(marketDetail.latest.last_trade_time)}</strong>
+                </div>
+                <div>
+                  <p>Last snapshot</p>
+                  <strong>{formatTimestamp(marketDetail.latest.timestamp)}</strong>
+                </div>
               </div>
 
               {detailCoverageNote && (
                 <div className="coverage-note">{detailCoverageNote}</div>
+              )}
+              {qualityNote && (
+                <div className="coverage-note warning">{qualityNote}</div>
+              )}
+              {whaleNote && (
+                <div className="coverage-note warning">{whaleNote}</div>
               )}
 
               <div className="signal-grid">
@@ -574,6 +669,23 @@ export default function App() {
                   <p>Burstiness</p>
                   <strong>{marketDetail.retail_signals.burstiness?.toFixed(2)}x</strong>
                   <span className="hint">Peak hourly surge</span>
+                </div>
+                <div className="signal-card">
+                  <p>Whale share</p>
+                  <strong>{formatPercent(marketDetail.retail_signals.whale_share)}</strong>
+                  <span className="hint">Top 1% trade volume</span>
+                </div>
+                <div className="signal-card flow-attention-card">
+                  <p>Flow vs attention</p>
+                  <div className="flow-attention-grid">
+                    <div className="flow-attention-dot" style={{
+                      left: `${Math.min(Math.max(flowAttention.flow, 0), 1) * 100}%`,
+                      top: `${(1 - Math.min(Math.max(flowAttention.attention, 0), 1)) * 100}%`
+                    }} />
+                    <span className="flow-label">Flow</span>
+                    <span className="attention-label">Attention</span>
+                  </div>
+                  <span className="hint">{flowAttention.label}</span>
                 </div>
               </div>
 

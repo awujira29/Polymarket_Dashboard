@@ -7,11 +7,17 @@ from retail_analyzer import RetailBehaviorAnalyzer
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 from math import sqrt
+import re
 from config import (
     TRACKED_CATEGORIES,
     RETAIL_SIZE_PERCENTILES,
     RETAIL_MIN_TRADES,
-    RETAIL_FALLBACK_THRESHOLD
+    RETAIL_FALLBACK_THRESHOLD,
+    MIN_MARKET_VOLUME_24H,
+    MIN_MARKET_LIQUIDITY,
+    TRADE_TRIM_PCT,
+    TRADE_WINSOR_PCT,
+    BURSTINESS_SMOOTH_WINDOW
 )
 
 app = FastAPI(title="Prediction Market Retail Behavior API")
@@ -144,6 +150,64 @@ def _retail_score(
 
     return score, level, drivers, 10.0
 
+def _winsorize(values: List[float], lower_pct: float, upper_pct: float) -> List[float]:
+    if not values:
+        return []
+    lower = _percentile(values, lower_pct)
+    upper = _percentile(values, 1 - upper_pct)
+    return [min(max(v, lower), upper) for v in values]
+
+def _trimmed_mean(values: List[float], trim_pct: float) -> float:
+    if not values:
+        return 0
+    sorted_values = sorted(values)
+    trim = int(len(sorted_values) * trim_pct)
+    if trim * 2 >= len(sorted_values):
+        return sum(sorted_values) / len(sorted_values)
+    trimmed = sorted_values[trim:-trim]
+    return sum(trimmed) / len(trimmed) if trimmed else 0
+
+def _smooth_series(values: List[float], window: int) -> List[float]:
+    if window <= 1 or not values:
+        return values
+    smoothed = []
+    for idx in range(len(values)):
+        start = max(0, idx - window + 1)
+        bucket = values[start:idx + 1]
+        smoothed.append(sum(bucket) / len(bucket))
+    return smoothed
+
+def _market_quality_ok(volume_24h: float | None, liquidity: float | None) -> tuple[bool, str | None]:
+    volume_ok = (volume_24h or 0) >= MIN_MARKET_VOLUME_24H
+    liquidity_ok = (liquidity or 0) >= MIN_MARKET_LIQUIDITY
+    if volume_ok and liquidity_ok:
+        return True, None
+    if not volume_ok and not liquidity_ok:
+        return False, "low_volume_and_liquidity"
+    if not volume_ok:
+        return False, "low_volume"
+    return False, "low_liquidity"
+
+def _canonical_market_id(market: Market) -> str:
+    if getattr(market, "condition_id", None):
+        return str(market.condition_id)
+    title = (market.title or "").strip().lower()
+    if not title:
+        return str(market.id)
+    slug = re.sub(r"[^a-z0-9]+", "-", title).strip("-")
+    return slug or str(market.id)
+
+def _whale_share(values: List[float]) -> tuple[float, int]:
+    if not values:
+        return 0.0, 0
+    sorted_values = sorted(values, reverse=True)
+    top_k = max(1, int(len(sorted_values) * 0.01))
+    total = sum(sorted_values)
+    if total <= 0:
+        return 0.0, top_k
+    whale_volume = sum(sorted_values[:top_k])
+    return whale_volume / total, top_k
+
 def _trade_size_to_share(avg_trade_size: float) -> float:
     if not avg_trade_size:
         return 0
@@ -207,6 +271,11 @@ def _compute_retail_signals(trades: List[Trade], category: str | None = None) ->
             "weekend_share": 0,
             "burstiness": 0,
             "volatility": 0,
+            "whale_share": None,
+            "whale_trade_count": None,
+            "whale_dominated": False,
+            "flow_score": 0,
+            "attention_score": 0,
             "score": 0,
             "level": "low",
             "drivers": [],
@@ -220,37 +289,47 @@ def _compute_retail_signals(trades: List[Trade], category: str | None = None) ->
             "score_max": 10.0
         }
 
-    values = [t.value for t in trades]
+    filtered_trades = [
+        t for t in trades
+        if t.value is not None and t.value > 0 and t.timestamp is not None
+    ]
+    values = [t.value for t in filtered_trades]
     total_trades = len(values)
+    if total_trades == 0:
+        return _compute_retail_signals([])
     total_volume = sum(values)
-    avg_trade_size = total_volume / total_trades
-    median_trade_size = _safe_median(values)
+    winsorized = _winsorize(values, TRADE_WINSOR_PCT, TRADE_WINSOR_PCT)
+    avg_trade_size = _trimmed_mean(winsorized, TRADE_TRIM_PCT)
+    median_trade_size = _safe_median(winsorized)
 
-    threshold, method = _retail_threshold(values, category)
+    threshold, method = _retail_threshold(winsorized, category)
     small_trade_values = [v for v in values if v <= threshold]
     small_trade_count = len(small_trade_values)
     small_trade_share = small_trade_count / total_trades
     retail_volume_share = sum(small_trade_values) / total_volume if total_volume > 0 else 0
+    whale_share, whale_count = _whale_share(values)
+    whale_dominated = whale_share >= 0.5
 
     evening_count = sum(
-        1 for t in trades
+        1 for t in filtered_trades
         if t.timestamp and (t.timestamp.hour >= 18 or t.timestamp.hour <= 5)
     )
     weekend_count = sum(
-        1 for t in trades
+        1 for t in filtered_trades
         if t.timestamp and t.timestamp.weekday() >= 5
     )
     evening_share = evening_count / total_trades
     weekend_share = weekend_count / total_trades
 
     hourly_volume = {}
-    for trade in trades:
+    for trade in filtered_trades:
         if not trade.timestamp:
             continue
         bucket = trade.timestamp.replace(minute=0, second=0, microsecond=0)
         hourly_volume[bucket] = hourly_volume.get(bucket, 0) + trade.value
 
-    hourly_values = list(hourly_volume.values())
+    hourly_values = [hourly_volume[key] for key in sorted(hourly_volume.keys())]
+    hourly_values = _smooth_series(hourly_values, BURSTINESS_SMOOTH_WINDOW)
     if hourly_values:
         hourly_mean = sum(hourly_values) / len(hourly_values)
         hourly_std = sqrt(sum((v - hourly_mean) ** 2 for v in hourly_values) / len(hourly_values))
@@ -266,6 +345,8 @@ def _compute_retail_signals(trades: List[Trade], category: str | None = None) ->
         weekend_share,
         burstiness
     )
+    flow_score = min(1.0, (small_trade_share / 0.6) * 0.7 + (retail_volume_share / 0.5) * 0.3)
+    attention_score = min(1.0, max(burstiness - 1.0, 0.0) / 1.5)
 
     return {
         "total_trades": total_trades,
@@ -278,6 +359,11 @@ def _compute_retail_signals(trades: List[Trade], category: str | None = None) ->
         "weekend_share": weekend_share,
         "burstiness": burstiness,
         "volatility": volatility,
+        "whale_share": whale_share,
+        "whale_trade_count": whale_count,
+        "whale_dominated": whale_dominated,
+        "flow_score": flow_score,
+        "attention_score": attention_score,
         "score": score,
         "score_max": score_max,
         "level": level,
@@ -301,12 +387,13 @@ def _compute_snapshot_signals(snapshots: List[MarketSnapshot]) -> Dict:
 
     total_trades = sum(trade_counts)
     total_volume = volumes[-1] if volumes else 0
-    avg_trade_size = sum(avg_trade_sizes) / len(avg_trade_sizes) if avg_trade_sizes else 0
-    median_trade_size = avg_trade_size
+    avg_trade_size = _trimmed_mean(avg_trade_sizes, TRADE_TRIM_PCT) if avg_trade_sizes else 0
+    median_trade_size = _safe_median(avg_trade_sizes) if avg_trade_sizes else avg_trade_size
 
-    mean_volume = sum(volumes) / len(volumes) if volumes else 0
-    std_volume = sqrt(sum((v - mean_volume) ** 2 for v in volumes) / len(volumes)) if mean_volume else 0
-    burstiness = max(volumes) / mean_volume if mean_volume > 0 else 0
+    smoothed_volumes = _smooth_series(volumes, BURSTINESS_SMOOTH_WINDOW)
+    mean_volume = sum(smoothed_volumes) / len(smoothed_volumes) if smoothed_volumes else 0
+    std_volume = sqrt(sum((v - mean_volume) ** 2 for v in smoothed_volumes) / len(smoothed_volumes)) if mean_volume else 0
+    burstiness = max(smoothed_volumes) / mean_volume if mean_volume > 0 else 0
     volatility = std_volume / mean_volume if mean_volume > 0 else 0
 
     evening_share = sum(1 for s in snapshots if s.is_evening) / len(snapshots)
@@ -320,6 +407,8 @@ def _compute_snapshot_signals(snapshots: List[MarketSnapshot]) -> Dict:
         weekend_share,
         burstiness
     )
+    flow_score = min(1.0, small_trade_share / 0.6) if small_trade_share else 0.0
+    attention_score = min(1.0, max(burstiness - 1.0, 0.0) / 1.5) if burstiness else 0.0
 
     return {
         "total_trades": total_trades,
@@ -332,6 +421,11 @@ def _compute_snapshot_signals(snapshots: List[MarketSnapshot]) -> Dict:
         "weekend_share": weekend_share,
         "burstiness": burstiness,
         "volatility": volatility,
+        "whale_share": None,
+        "whale_trade_count": None,
+        "whale_dominated": False,
+        "flow_score": flow_score,
+        "attention_score": attention_score,
         "score": score,
         "score_max": score_max,
         "level": level,
@@ -352,7 +446,8 @@ def _compute_lifecycle(snapshots: List[MarketSnapshot]) -> Dict:
             "trend": 0,
             "growth_rate": 0,
             "volatility": 0,
-            "spike_count": 0
+            "spike_count": 0,
+            "confidence": 0
         }
 
     volumes = [s.volume_24h or 0 for s in snapshots]
@@ -376,12 +471,17 @@ def _compute_lifecycle(snapshots: List[MarketSnapshot]) -> Dict:
     else:
         stage = "steady"
 
+    coverage = min(1.0, len(snapshots) / 30)
+    stability = max(0.0, 1.0 - min(volatility, 2.0) / 2.0)
+    confidence = round(coverage * stability, 2)
+
     return {
         "stage": stage,
         "trend": trend,
         "growth_rate": growth_rate,
         "volatility": volatility,
-        "spike_count": spike_count
+        "spike_count": spike_count,
+        "confidence": confidence
     }
 
 def _bucket_trade_sizes(trades: List[Trade]) -> List[Dict]:
@@ -434,12 +534,14 @@ def get_overview(days: int = 30):
                     "volume_24h": 0,
                     "liquidity": 0,
                     "avg_trade_size_sum": 0,
+                    "avg_trade_size_count": 0,
                     "snapshot_count": 0,
                     "trade_count_24h": 0,
                     "retail_trades_24h": 0,
                     "trade_volume_24h": 0,
                     "retail_volume_24h": 0,
-                    "retail_share_source": "snapshot"
+                    "retail_share_source": "snapshot",
+                    "quality_market_count": 0
                 }
 
             latest = (db.query(MarketSnapshot)
@@ -451,18 +553,24 @@ def get_overview(days: int = 30):
             if latest:
                 category_stats[category]["volume_24h"] += latest.volume_24h or 0
                 category_stats[category]["liquidity"] += latest.liquidity or 0
-                category_stats[category]["avg_trade_size_sum"] += latest.avg_trade_size or 0
                 category_stats[category]["snapshot_count"] += 1
+                if latest.avg_trade_size is not None:
+                    category_stats[category]["avg_trade_size_sum"] += latest.avg_trade_size
+                    category_stats[category]["avg_trade_size_count"] += 1
 
-                market_rollup.append({
-                    "id": market.id,
-                    "title": market.title,
-                    "category": category,
-                    "price": latest.price,
-                    "volume_24h": latest.volume_24h,
-                    "liquidity": latest.liquidity,
-                    "avg_trade_size": latest.avg_trade_size
-                })
+                quality_ok, _ = _market_quality_ok(latest.volume_24h, latest.liquidity)
+                if quality_ok:
+                    category_stats[category]["quality_market_count"] += 1
+                    market_rollup.append({
+                        "id": market.id,
+                        "canonical_id": _canonical_market_id(market),
+                        "title": market.title,
+                        "category": category,
+                        "price": latest.price,
+                        "volume_24h": latest.volume_24h,
+                        "liquidity": latest.liquidity,
+                        "avg_trade_size": latest.avg_trade_size
+                    })
 
         since = datetime.utcnow() - timedelta(days=days)
         trades_24h = db.query(Trade)\
@@ -484,12 +592,14 @@ def get_overview(days: int = 30):
                     "volume_24h": 0,
                     "liquidity": 0,
                     "avg_trade_size_sum": 0,
+                    "avg_trade_size_count": 0,
                     "snapshot_count": 0,
                     "trade_count_24h": 0,
                     "retail_trades_24h": 0,
                     "trade_volume_24h": 0,
                     "retail_volume_24h": 0,
-                    "retail_share_source": "snapshot"
+                    "retail_share_source": "snapshot",
+                    "quality_market_count": 0
                 }
 
             trade_count = len(values)
@@ -508,29 +618,49 @@ def get_overview(days: int = 30):
         categories = []
         for category, stats in category_stats.items():
             snapshot_count = stats["snapshot_count"] or 1
+            avg_trade_size_count = stats["avg_trade_size_count"] or 0
             trade_count = stats.get("trade_count_24h", 0)
             trade_volume = stats.get("trade_volume_24h", 0)
+
+            avg_trade_size = (
+                stats["avg_trade_size_sum"] / avg_trade_size_count
+                if avg_trade_size_count > 0 else None
+            )
+
             if trade_count >= RETAIL_MIN_TRADES and stats.get("retail_share_source") == "trade":
                 retail_share = stats["retail_trades_24h"] / stats["trade_count_24h"]
                 retail_volume_share = stats["retail_volume_24h"] / trade_volume if trade_volume > 0 else 0
                 retail_share_source = "trade"
-            else:
-                avg_trade_size = stats["avg_trade_size_sum"] / snapshot_count
+            elif avg_trade_size is not None:
                 retail_share = _trade_size_to_share(avg_trade_size)
                 retail_volume_share = None
                 retail_share_source = stats.get("retail_share_source", "snapshot")
+            else:
+                retail_share = None
+                retail_volume_share = None
+                retail_share_source = "insufficient"
+
             categories.append({
                 "category": category,
                 "market_count": stats["market_count"],
                 "volume_24h": stats["volume_24h"],
-                "avg_trade_size": stats["avg_trade_size_sum"] / snapshot_count,
+                "avg_trade_size": avg_trade_size,
                 "liquidity": stats["liquidity"],
                 "trade_count_24h": stats["trade_count_24h"],
                 "retail_trade_share": retail_share,
                 "retail_volume_share": retail_volume_share,
-                "retail_share_source": retail_share_source
+                "retail_share_source": retail_share_source,
+                "quality_market_count": stats.get("quality_market_count", 0)
             })
 
+        deduped_rollup = {}
+        for entry in market_rollup:
+            key = entry.get("canonical_id") or entry.get("id")
+            existing = deduped_rollup.get(key)
+            if not existing or (entry.get("volume_24h") or 0) > (existing.get("volume_24h") or 0):
+                deduped_rollup[key] = entry
+
+        market_rollup = list(deduped_rollup.values())
         market_rollup.sort(key=lambda x: x["volume_24h"] or 0, reverse=True)
         top_volume = market_rollup[:8]
         top_retail = sorted(
@@ -557,7 +687,7 @@ def get_overview(days: int = 30):
         db.close()
 
 @app.get("/markets")
-def list_markets(category: str | None = None, limit: int = 25, days: int = 30):
+def list_markets(category: str | None = None, limit: int = 25, days: int = 30, hide_whales: bool = False):
     """List markets with latest stats and retail signals."""
     db = get_db_session()
 
@@ -581,19 +711,25 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30):
                       .first())
             if not latest:
                 continue
-            trade_count, total_value = db.query(
+            quality_ok, quality_reason = _market_quality_ok(latest.volume_24h, latest.liquidity)
+            trade_count, total_value, last_trade_time = db.query(
                 func.count(Trade.id),
-                func.sum(Trade.value)
+                func.sum(Trade.value),
+                func.max(Trade.timestamp)
             ).filter(
                 Trade.market_id == market.id,
                 Trade.timestamp >= since
             ).one()
             trade_count = trade_count or 0
             total_value = total_value or 0
-            avg_trade_size_window = total_value / trade_count if trade_count > 0 else None
+            avg_trade_size_window = (
+                total_value / trade_count
+                if trade_count >= RETAIL_MIN_TRADES else None
+            )
 
             rows.append({
                 "id": market.id,
+                "canonical_id": _canonical_market_id(market),
                 "title": market.title,
                 "category": _normalize_category(market.category),
                 "description": market.description,
@@ -604,11 +740,30 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30):
                 "avg_trade_size": latest.avg_trade_size,
                 "avg_trade_size_window": avg_trade_size_window,
                 "trade_count_window": trade_count,
-                "last_updated": _to_utc_iso(latest.timestamp)
+                "last_updated": _to_utc_iso(latest.timestamp),
+                "last_trade_time": _to_utc_iso(last_trade_time),
+                "quality_ok": quality_ok,
+                "quality_reason": quality_reason
             })
 
         rows.sort(key=lambda x: x["volume_24h"] or 0, reverse=True)
-        rows = rows[:limit]
+        deduped = {}
+        for row in rows:
+            key = row.get("canonical_id") or row.get("id")
+            existing = deduped.get(key)
+            if not existing:
+                deduped[key] = row
+                continue
+            if row.get("quality_ok") and not existing.get("quality_ok"):
+                deduped[key] = row
+                continue
+            if (row.get("trade_count_window") or 0) > (existing.get("trade_count_window") or 0):
+                deduped[key] = row
+                continue
+            if (row.get("volume_24h") or 0) > (existing.get("volume_24h") or 0):
+                deduped[key] = row
+        rows = list(deduped.values())
+        rows.sort(key=lambda x: x["volume_24h"] or 0, reverse=True)
 
         for row in rows:
             trades = db.query(Trade)\
@@ -617,7 +772,7 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30):
                 .order_by(desc(Trade.timestamp))\
                 .limit(300)\
                 .all()
-            if len(trades) >= RETAIL_MIN_TRADES:
+            if len(trades) >= RETAIL_MIN_TRADES and row.get("quality_ok"):
                 row["retail_signals"] = _compute_retail_signals(trades, row["category"])
             else:
                 snapshots = db.query(MarketSnapshot)\
@@ -634,6 +789,46 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30):
                 row["retail_signals"] = _compute_snapshot_signals(snapshots)
                 row["retail_signals"]["coverage"] = "insufficient"
                 row["retail_signals"]["sample_trades"] = len(trades)
+            row["retail_signals"]["quality_ok"] = row.get("quality_ok", False)
+            row["retail_signals"]["quality_reason"] = row.get("quality_reason")
+
+        scores_by_category = {}
+        for row in rows:
+            signals = row.get("retail_signals") or {}
+            if signals.get("coverage") != "trade":
+                continue
+            if not row.get("quality_ok"):
+                continue
+            score = signals.get("score")
+            if score is None:
+                continue
+            scores_by_category.setdefault(row["category"], []).append(score)
+
+        stats_by_category = {}
+        for cat, scores in scores_by_category.items():
+            if not scores:
+                continue
+            mean = sum(scores) / len(scores)
+            variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+            std = variance ** 0.5
+            stats_by_category[cat] = (mean, std)
+
+        for row in rows:
+            signals = row.get("retail_signals") or {}
+            score = signals.get("score")
+            mean_std = stats_by_category.get(row["category"])
+            if score is None or not mean_std or mean_std[1] == 0:
+                row["retail_score_z"] = None
+            else:
+                row["retail_score_z"] = (score - mean_std[0]) / mean_std[1]
+
+        if hide_whales:
+            rows = [
+                row for row in rows
+                if not (row.get("retail_signals") or {}).get("whale_dominated")
+            ]
+
+        rows = rows[:limit]
 
         return {
             "total": len(rows),
@@ -664,34 +859,43 @@ def get_market_detail(market_id: str, hours: int = 24):
             .order_by(desc(Trade.timestamp))\
             .limit(500)\
             .all()
-        trade_count, total_value = db.query(
+        trade_count, total_value, last_trade_time = db.query(
             func.count(Trade.id),
-            func.sum(Trade.value)
+            func.sum(Trade.value),
+            func.max(Trade.timestamp)
         ).filter(
             Trade.market_id == market_id,
             Trade.timestamp >= since
         ).one()
         trade_count = trade_count or 0
         total_value = total_value or 0
-        avg_trade_size_window = total_value / trade_count if trade_count > 0 else None
+        avg_trade_size_window = total_value / trade_count if trade_count >= RETAIL_MIN_TRADES else None
+
+        quality_ok, quality_reason = _market_quality_ok(
+            latest.volume_24h if latest else None,
+            latest.liquidity if latest else None
+        )
 
         snapshots = db.query(MarketSnapshot)\
             .filter_by(market_id=market_id)\
             .order_by(MarketSnapshot.timestamp)\
             .all()
 
-        if len(trades) >= RETAIL_MIN_TRADES:
+        if len(trades) >= RETAIL_MIN_TRADES and quality_ok:
             retail_signals = _compute_retail_signals(trades, _normalize_category(market.category))
         else:
             recent_snapshots = [s for s in snapshots if s.timestamp >= since]
             retail_signals = _compute_snapshot_signals(recent_snapshots or snapshots[-24:])
             retail_signals["coverage"] = "insufficient"
             retail_signals["sample_trades"] = len(trades)
+        retail_signals["quality_ok"] = quality_ok
+        retail_signals["quality_reason"] = quality_reason
         lifecycle = _compute_lifecycle(snapshots[-60:])
 
         return {
             "market": {
                 "id": market.id,
+                "canonical_id": _canonical_market_id(market),
                 "title": market.title,
                 "category": _normalize_category(market.category),
                 "subcategory": market.subcategory,
@@ -708,6 +912,7 @@ def get_market_detail(market_id: str, hours: int = 24):
                 "avg_trade_size": latest.avg_trade_size if latest else None,
                 "avg_trade_size_window": avg_trade_size_window,
                 "trade_count_window": trade_count,
+                "last_trade_time": _to_utc_iso(last_trade_time),
                 "timestamp": _to_utc_iso(latest.timestamp) if latest else None
             },
             "retail_signals": retail_signals,
@@ -797,18 +1002,27 @@ def get_markets_by_category(category: str, limit: int = 20):
                      .first())
 
             if latest:
+                quality_ok, quality_reason = _market_quality_ok(latest.volume_24h, latest.liquidity)
+                if not quality_ok:
+                    continue
                 # Get recent trades for retail metrics
                 recent_trades = db.query(Trade)\
                     .filter_by(market_id=market.id)\
                     .order_by(desc(Trade.timestamp))\
                     .limit(100)\
                     .all()
+                last_trade_time = db.query(func.max(Trade.timestamp))\
+                    .filter_by(market_id=market.id)\
+                    .scalar()
 
                 # Calculate retail metrics
                 retail_metrics = calculate_retail_metrics(recent_trades, _normalize_category(market.category))
+                retail_metrics["quality_ok"] = quality_ok
+                retail_metrics["quality_reason"] = quality_reason
 
                 result.append({
                     "id": market.id,
+                    "canonical_id": _canonical_market_id(market),
                     "title": market.title,
                     "category": market.category,
                     "event_title": market.event_title,
@@ -816,6 +1030,7 @@ def get_markets_by_category(category: str, limit: int = 20):
                     "volume_24h": latest.volume_24h,
                     "liquidity": latest.liquidity,
                     "last_updated": _to_utc_iso(latest.timestamp),
+                    "last_trade_time": _to_utc_iso(last_trade_time),
                     "retail_metrics": retail_metrics
                 })
 
@@ -839,6 +1054,14 @@ def get_market_trades(market_id: str, hours: int = 24, limit: int = 1000):
     try:
         market = db.query(Market).filter_by(id=market_id).first()
         market_category = market.category if market else None
+        latest = (db.query(MarketSnapshot)
+                  .filter_by(market_id=market_id)
+                  .order_by(desc(MarketSnapshot.timestamp))
+                  .first())
+        quality_ok, quality_reason = _market_quality_ok(
+            latest.volume_24h if latest else None,
+            latest.liquidity if latest else None
+        )
 
         # Get trades within time window
         since = datetime.utcnow() - timedelta(hours=hours)
@@ -850,13 +1073,18 @@ def get_market_trades(market_id: str, hours: int = 24, limit: int = 1000):
             .limit(limit)\
             .all()
 
-        values = [trade.value for trade in trades]
-        threshold, method = _retail_threshold(values, market_category) if values else (None, None)
-        coverage = "trade" if len(values) >= RETAIL_MIN_TRADES else "insufficient"
+        valid_trades = [
+            trade for trade in trades
+            if trade.value is not None and trade.value > 0 and trade.timestamp is not None
+        ]
+        values = [trade.value for trade in valid_trades]
+        winsorized = _winsorize(values, TRADE_WINSOR_PCT, TRADE_WINSOR_PCT)
+        threshold, method = _retail_threshold(winsorized, market_category) if values else (None, None)
+        coverage = "trade" if len(values) >= RETAIL_MIN_TRADES and quality_ok else "insufficient"
 
         # Convert to dict and calculate rolling metrics
         trade_data = []
-        for trade in trades:
+        for trade in valid_trades:
             is_retail = trade.value <= threshold if threshold is not None else False
             trade_data.append({
                 "timestamp": _to_utc_iso(trade.timestamp),
@@ -870,7 +1098,7 @@ def get_market_trades(market_id: str, hours: int = 24, limit: int = 1000):
 
         # Calculate time-bucketed retail metrics
         retail_analysis = analyze_trade_patterns(trade_data)
-        trade_size_distribution = _bucket_trade_sizes(trades)
+        trade_size_distribution = _bucket_trade_sizes(valid_trades)
 
         return {
             "market_id": market_id,
@@ -882,6 +1110,8 @@ def get_market_trades(market_id: str, hours: int = 24, limit: int = 1000):
             "retail_threshold_method": method,
             "retail_threshold_trades": len(values),
             "retail_coverage": coverage,
+            "quality_ok": quality_ok,
+            "quality_reason": quality_reason,
             "retail_min_trades": RETAIL_MIN_TRADES
         }
 
@@ -908,6 +1138,16 @@ def get_retail_dashboard():
             category_trades = []
 
             for market in markets:
+                latest = (db.query(MarketSnapshot)
+                          .filter_by(market_id=market.id)
+                          .order_by(desc(MarketSnapshot.timestamp))
+                          .first())
+                quality_ok, _ = _market_quality_ok(
+                    latest.volume_24h if latest else None,
+                    latest.liquidity if latest else None
+                )
+                if not quality_ok:
+                    continue
                 recent_trades = db.query(Trade)\
                     .filter_by(market_id=market.id)\
                     .filter(Trade.timestamp >= datetime.utcnow() - timedelta(hours=24))\
@@ -932,7 +1172,16 @@ def get_retail_dashboard():
                 .filter(Trade.timestamp >= datetime.utcnow() - timedelta(hours=24))\
                 .all()
 
-            if recent_trades:
+            latest = (db.query(MarketSnapshot)
+                      .filter_by(market_id=market.id)
+                      .order_by(desc(MarketSnapshot.timestamp))
+                      .first())
+            quality_ok, _ = _market_quality_ok(
+                latest.volume_24h if latest else None,
+                latest.liquidity if latest else None
+            )
+
+            if recent_trades and quality_ok and len(recent_trades) >= RETAIL_MIN_TRADES:
                 metrics = calculate_retail_metrics(recent_trades, _normalize_category(market.category))
                 if metrics['retail_percentage'] > 50:  # High retail activity
                     top_retail_markets.append({
@@ -983,12 +1232,17 @@ def get_retail_time_series(category: str, hours: int = 24):
             .order_by(Trade.timestamp)\
             .all()
 
-        values = [trade.value for trade in trades]
-        threshold, method = _retail_threshold(values, category) if values else (None, None)
+        valid_trades = [
+            trade for trade in trades
+            if trade.value is not None and trade.value > 0 and trade.timestamp is not None
+        ]
+        values = [trade.value for trade in valid_trades]
+        winsorized = _winsorize(values, TRADE_WINSOR_PCT, TRADE_WINSOR_PCT)
+        threshold, method = _retail_threshold(winsorized, category) if values else (None, None)
 
         # Bucket trades by hour
         hourly_data = {}
-        for trade in trades:
+        for trade in valid_trades:
             hour_key = trade.timestamp.replace(minute=0, second=0, microsecond=0)
             if hour_key not in hourly_data:
                 hourly_data[hour_key] = {
@@ -1046,6 +1300,11 @@ def calculate_retail_metrics(trades, category: str | None = None):
             "retail_percentage": 0,
             "retail_trade_count": 0,
             "retail_volume_share": 0,
+            "whale_share": None,
+            "whale_trade_count": None,
+            "whale_dominated": False,
+            "flow_score": 0,
+            "attention_score": 0,
             "retail_threshold": None,
             "retail_threshold_method": None,
             "coverage": "insufficient",
@@ -1055,27 +1314,43 @@ def calculate_retail_metrics(trades, category: str | None = None):
             "confidence_score": 0.0
         }
 
-    trade_values = [trade.value for trade in trades]
-    threshold, method = _retail_threshold(trade_values, category)
+    filtered_trades = [
+        trade for trade in trades
+        if trade.value is not None and trade.value > 0 and trade.timestamp is not None
+    ]
+    trade_values = [trade.value for trade in filtered_trades]
+    winsorized = _winsorize(trade_values, TRADE_WINSOR_PCT, TRADE_WINSOR_PCT)
+    threshold, method = _retail_threshold(winsorized, category)
     retail_trades = [v for v in trade_values if v <= threshold]
     total_volume = sum(trade_values)
     retail_volume_share = sum(retail_trades) / total_volume if total_volume > 0 else 0
+    avg_trade_size = _trimmed_mean(winsorized, TRADE_TRIM_PCT) if trade_values else 0
+    whale_share, whale_count = _whale_share(trade_values)
+    whale_dominated = whale_share >= 0.5
+    small_trade_share = len(retail_trades) / len(trade_values) if trade_values else 0
+    flow_score = min(1.0, (small_trade_share / 0.6) * 0.7 + (retail_volume_share / 0.5) * 0.3) if trade_values else 0
+    attention_score = 0.0
 
     return {
-        "total_trades": len(trades),
+        "total_trades": len(trade_values),
         "total_volume": total_volume,
-        "avg_trade_size": total_volume / len(trades),
-        "retail_percentage": (len(retail_trades) / len(trades)) * 100,
+        "avg_trade_size": avg_trade_size,
+        "retail_percentage": (len(retail_trades) / len(trade_values)) * 100 if trade_values else 0,
         "retail_trade_count": len(retail_trades),
         "retail_volume_share": retail_volume_share,
-        "median_trade_size": sorted(trade_values)[len(trade_values)//2],
+        "median_trade_size": _safe_median(winsorized),
+        "whale_share": whale_share,
+        "whale_trade_count": whale_count,
+        "whale_dominated": whale_dominated,
+        "flow_score": flow_score,
+        "attention_score": attention_score,
         "retail_threshold": threshold,
         "retail_threshold_method": method,
-        "coverage": "trade" if len(trades) >= RETAIL_MIN_TRADES else "insufficient",
-        "sample_trades": len(trades),
+        "coverage": "trade" if len(trade_values) >= RETAIL_MIN_TRADES else "insufficient",
+        "sample_trades": len(trade_values),
         "min_trades": RETAIL_MIN_TRADES,
-        "confidence_label": _confidence_label(len(trades)),
-        "confidence_score": _confidence_score(len(trades))
+        "confidence_label": _confidence_label(len(trade_values)),
+        "confidence_score": _confidence_score(len(trade_values))
     }
 
 def analyze_trade_patterns(trade_data):
@@ -1168,6 +1443,9 @@ def get_retail_insights():
                      .first())
 
             if latest:
+                quality_ok, _ = _market_quality_ok(latest.volume_24h, latest.liquidity)
+                if not quality_ok:
+                    continue
                 total_volume += latest.volume_24h or 0
 
                 # Identify high retail markets (small trade sizes)
@@ -1230,8 +1508,11 @@ def get_analytics_overview():
                      .filter_by(market_id=market.id)
                      .order_by(desc(MarketSnapshot.timestamp))
                      .first())
-            
+
             if latest:
+                quality_ok, _ = _market_quality_ok(latest.volume_24h, latest.liquidity)
+                if not quality_ok:
+                    continue
                 top_markets.append({
                     "id": market.id,
                     "title": market.title,

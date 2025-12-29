@@ -241,6 +241,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
   font-size: 0.75rem;
   color: var(--muted);
 }
@@ -248,6 +249,7 @@
 .market-stats {
   display: flex;
   gap: 16px;
+  flex-wrap: wrap;
   font-size: 0.75rem;
   color: var(--muted);
 }
@@ -353,6 +355,12 @@
   color: var(--muted);
 }
 
+.coverage-note.warning {
+  border-color: rgba(240, 132, 58, 0.5);
+  background: rgba(240, 132, 58, 0.08);
+  color: #8a4b12;
+}
+
 .signal-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -376,6 +384,46 @@
   font-size: 1.2rem;
   display: block;
   margin-top: 4px;
+}
+
+.flow-attention-card {
+  position: relative;
+}
+
+.flow-attention-grid {
+  position: relative;
+  height: 70px;
+  margin-top: 8px;
+  border-radius: 12px;
+  border: 1px dashed var(--stroke);
+  background: linear-gradient(120deg, rgba(27, 153, 139, 0.12), rgba(242, 177, 52, 0.08));
+  overflow: hidden;
+}
+
+.flow-attention-dot {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ink);
+  transform: translate(-50%, -50%);
+}
+
+.flow-attention-grid .flow-label,
+.flow-attention-grid .attention-label {
+  position: absolute;
+  font-size: 0.65rem;
+  color: var(--muted);
+}
+
+.flow-attention-grid .flow-label {
+  left: 8px;
+  bottom: 6px;
+}
+
+.flow-attention-grid .attention-label {
+  right: 8px;
+  top: 6px;
 }
 
 .chart-grid {

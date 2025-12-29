@@ -30,6 +30,13 @@ TRADE_LOOKBACK_DAYS_FULL = 30
 # Data collection interval (in seconds)
 COLLECTION_INTERVAL = 900  # 15 minutes
 
+# Noise filters / quality gates
+MIN_MARKET_VOLUME_24H = 1000.0
+MIN_MARKET_LIQUIDITY = 500.0
+TRADE_TRIM_PCT = 0.05
+TRADE_WINSOR_PCT = 0.05
+BURSTINESS_SMOOTH_WINDOW = 3
+
 # Retail detection thresholds
 RETAIL_THRESHOLDS = {
     "volume_spike_multiplier": 2.0,
