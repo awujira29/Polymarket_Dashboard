@@ -277,6 +277,12 @@ export default function App() {
     return `Insufficient trades in window (${sample}/${minTrades}). Showing snapshot-derived signals.`;
   }, [marketDetail]);
 
+  const detailConfidenceLabel = useMemo(() => {
+    const label = marketDetail?.retail_signals?.confidence_label;
+    if (!label || label === 'insufficient') return '';
+    return `Confidence: ${label}`;
+  }, [marketDetail]);
+
   if (loading) {
     return (
       <div className="app-shell">
@@ -516,6 +522,7 @@ export default function App() {
                       marketDetail.retail_signals.sample_trades
                     )}
                   </span>
+                  {detailConfidenceLabel && <span className="hint">{detailConfidenceLabel}</span>}
                 </div>
               </div>
 
@@ -669,7 +676,9 @@ export default function App() {
                   </div>
                   <div>
                     <p>Score</p>
-                    <strong>{marketDetail.retail_signals.score}/8</strong>
+                    <strong>
+                      {marketDetail.retail_signals.score}/{marketDetail.retail_signals.score_max ?? 10}
+                    </strong>
                   </div>
                 </div>
               </div>

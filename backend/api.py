@@ -93,6 +93,57 @@ def _retail_threshold(
         return fallback, "fixed"
     return _percentile(values, percentile), "percentile"
 
+def _confidence_label(sample: int, min_trades: int = RETAIL_MIN_TRADES) -> str:
+    if sample >= min_trades * 3:
+        return "high"
+    if sample >= min_trades * 2:
+        return "medium"
+    if sample >= min_trades:
+        return "low"
+    return "insufficient"
+
+def _confidence_score(sample: int, min_trades: int = RETAIL_MIN_TRADES) -> float:
+    if sample <= 0:
+        return 0.0
+    return min(1.0, sample / (min_trades * 3))
+
+def _retail_score(
+    small_trade_share: float,
+    evening_share: float,
+    weekend_share: float,
+    burstiness: float
+) -> tuple[float, str, List[str], float]:
+    small_score = min(small_trade_share / 0.6, 1.0) if small_trade_share else 0.0
+    evening_score = min(evening_share / 0.35, 1.0) if evening_share else 0.0
+    weekend_score = min(weekend_share / 0.35, 1.0) if weekend_share else 0.0
+    burst_score = min(max(burstiness - 1.0, 0.0) / 1.5, 1.0) if burstiness else 0.0
+
+    weighted = (
+        (0.45 * small_score) +
+        (0.15 * evening_score) +
+        (0.15 * weekend_score) +
+        (0.25 * burst_score)
+    )
+    score = round(weighted * 10, 2)
+
+    drivers = []
+    if small_score >= 0.7:
+        drivers.append("small_trade_bias")
+    if evening_score >= 0.7:
+        drivers.append("evening_activity")
+    if weekend_score >= 0.7:
+        drivers.append("weekend_activity")
+    if burst_score >= 0.6:
+        drivers.append("volume_spikes")
+
+    level = "low"
+    if score >= 7:
+        level = "high"
+    elif score >= 4:
+        level = "medium"
+
+    return score, level, drivers, 10.0
+
 def _trade_size_to_share(avg_trade_size: float) -> float:
     if not avg_trade_size:
         return 0
@@ -128,6 +179,21 @@ def _to_utc_iso(value: datetime | None) -> str | None:
         value = value.astimezone(timezone.utc)
     return value.isoformat()
 
+def _parse_trade_timestamp(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+    return None
+
 def _compute_retail_signals(trades: List[Trade], category: str | None = None) -> Dict:
     if not trades:
         return {
@@ -146,9 +212,12 @@ def _compute_retail_signals(trades: List[Trade], category: str | None = None) ->
             "drivers": [],
             "retail_threshold": None,
             "retail_threshold_method": None,
-            "coverage": "none",
+            "coverage": "insufficient",
             "sample_trades": 0,
-            "min_trades": RETAIL_MIN_TRADES
+            "min_trades": RETAIL_MIN_TRADES,
+            "confidence_label": "insufficient",
+            "confidence_score": 0.0,
+            "score_max": 10.0
         }
 
     values = [t.value for t in trades]
@@ -191,35 +260,12 @@ def _compute_retail_signals(trades: List[Trade], category: str | None = None) ->
         burstiness = 0
         volatility = 0
 
-    score = 0
-    drivers = []
-    if small_trade_share > 0.6:
-        score += 3
-        drivers.append("small_trade_bias")
-    elif small_trade_share > 0.4:
-        score += 2
-        drivers.append("retail_trade_mix")
-
-    if evening_share > 0.35:
-        score += 1
-        drivers.append("evening_activity")
-
-    if weekend_share > 0.35:
-        score += 1
-        drivers.append("weekend_activity")
-
-    if burstiness > 2:
-        score += 2
-        drivers.append("volume_spikes")
-    elif burstiness > 1.5:
-        score += 1
-        drivers.append("volume_swings")
-
-    level = "low"
-    if score >= 6:
-        level = "high"
-    elif score >= 3:
-        level = "medium"
+    score, level, drivers, score_max = _retail_score(
+        small_trade_share,
+        evening_share,
+        weekend_share,
+        burstiness
+    )
 
     return {
         "total_trades": total_trades,
@@ -233,13 +279,16 @@ def _compute_retail_signals(trades: List[Trade], category: str | None = None) ->
         "burstiness": burstiness,
         "volatility": volatility,
         "score": score,
+        "score_max": score_max,
         "level": level,
         "drivers": drivers,
         "retail_threshold": threshold,
         "retail_threshold_method": method,
         "coverage": "trade",
         "sample_trades": total_trades,
-        "min_trades": RETAIL_MIN_TRADES
+        "min_trades": RETAIL_MIN_TRADES,
+        "confidence_label": _confidence_label(total_trades),
+        "confidence_score": _confidence_score(total_trades)
     }
 
 def _compute_snapshot_signals(snapshots: List[MarketSnapshot]) -> Dict:
@@ -265,35 +314,12 @@ def _compute_snapshot_signals(snapshots: List[MarketSnapshot]) -> Dict:
 
     small_trade_share = _trade_size_to_share(avg_trade_size)
 
-    score = 0
-    drivers = []
-    if small_trade_share >= 0.5:
-        score += 3
-        drivers.append("small_trade_bias")
-    elif small_trade_share >= 0.35:
-        score += 2
-        drivers.append("retail_trade_mix")
-
-    if evening_share > 0.35:
-        score += 1
-        drivers.append("evening_activity")
-
-    if weekend_share > 0.35:
-        score += 1
-        drivers.append("weekend_activity")
-
-    if burstiness > 2:
-        score += 2
-        drivers.append("volume_spikes")
-    elif burstiness > 1.5:
-        score += 1
-        drivers.append("volume_swings")
-
-    level = "low"
-    if score >= 6:
-        level = "high"
-    elif score >= 3:
-        level = "medium"
+    score, level, drivers, score_max = _retail_score(
+        small_trade_share,
+        evening_share,
+        weekend_share,
+        burstiness
+    )
 
     return {
         "total_trades": total_trades,
@@ -307,13 +333,16 @@ def _compute_snapshot_signals(snapshots: List[MarketSnapshot]) -> Dict:
         "burstiness": burstiness,
         "volatility": volatility,
         "score": score,
+        "score_max": score_max,
         "level": level,
         "drivers": drivers,
         "retail_threshold": None,
         "retail_threshold_method": None,
         "coverage": "snapshot",
         "sample_trades": total_trades,
-        "min_trades": RETAIL_MIN_TRADES
+        "min_trades": RETAIL_MIN_TRADES,
+        "confidence_label": "insufficient",
+        "confidence_score": 0.0
     }
 
 def _compute_lifecycle(snapshots: List[MarketSnapshot]) -> Dict:
@@ -473,6 +502,8 @@ def get_overview(days: int = 30):
                 category_stats[category]["retail_trades_24h"] = sum(1 for v in values if v <= threshold)
                 category_stats[category]["retail_volume_24h"] = sum(v for v in values if v <= threshold)
                 category_stats[category]["retail_share_source"] = "trade"
+            elif trade_count > 0:
+                category_stats[category]["retail_share_source"] = "insufficient"
 
         categories = []
         for category, stats in category_stats.items():
@@ -487,7 +518,7 @@ def get_overview(days: int = 30):
                 avg_trade_size = stats["avg_trade_size_sum"] / snapshot_count
                 retail_share = _trade_size_to_share(avg_trade_size)
                 retail_volume_share = None
-                retail_share_source = "snapshot"
+                retail_share_source = stats.get("retail_share_source", "snapshot")
             categories.append({
                 "category": category,
                 "market_count": stats["market_count"],
@@ -1017,9 +1048,11 @@ def calculate_retail_metrics(trades, category: str | None = None):
             "retail_volume_share": 0,
             "retail_threshold": None,
             "retail_threshold_method": None,
-            "coverage": "none",
+            "coverage": "insufficient",
             "sample_trades": 0,
-            "min_trades": RETAIL_MIN_TRADES
+            "min_trades": RETAIL_MIN_TRADES,
+            "confidence_label": "insufficient",
+            "confidence_score": 0.0
         }
 
     trade_values = [trade.value for trade in trades]
@@ -1040,7 +1073,9 @@ def calculate_retail_metrics(trades, category: str | None = None):
         "retail_threshold_method": method,
         "coverage": "trade" if len(trades) >= RETAIL_MIN_TRADES else "insufficient",
         "sample_trades": len(trades),
-        "min_trades": RETAIL_MIN_TRADES
+        "min_trades": RETAIL_MIN_TRADES,
+        "confidence_label": _confidence_label(len(trades)),
+        "confidence_score": _confidence_score(len(trades))
     }
 
 def analyze_trade_patterns(trade_data):
@@ -1055,7 +1090,11 @@ def analyze_trade_patterns(trade_data):
     # Group by hour
     hourly_patterns = {}
     for trade in trade_data:
-        dt = datetime.fromisoformat(trade['timestamp'])
+        dt = _parse_trade_timestamp(trade.get('timestamp'))
+        if not dt:
+            continue
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
         hour = dt.hour
 
         if hour not in hourly_patterns:

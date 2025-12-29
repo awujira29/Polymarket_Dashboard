@@ -24,6 +24,8 @@ TRACKED_CATEGORIES = ["crypto", "sports", "politics"]
 
 # Public trade feed backfill depth (pages of 500 trades)
 TRADE_PAGES = 30
+TRADE_LOOKBACK_DAYS_FAST = 7
+TRADE_LOOKBACK_DAYS_FULL = 30
 
 # Data collection interval (in seconds)
 COLLECTION_INTERVAL = 900  # 15 minutes

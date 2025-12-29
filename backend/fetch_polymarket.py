@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 from config import (
     RETAIL_SIZE_PERCENTILES,
     RETAIL_MIN_TRADES,
-    RETAIL_FALLBACK_THRESHOLD
+    RETAIL_FALLBACK_THRESHOLD,
+    TRADE_LOOKBACK_DAYS_FULL
 )
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -120,6 +121,37 @@ class PolymarketCollector:
             except ValueError:
                 return default
         return default
+
+    def _utc_now(self) -> datetime:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def _to_utc_naive(self, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def _parse_trade_timestamp(self, value) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return self._to_utc_naive(value)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            if raw.isdigit():
+                try:
+                    return datetime.fromtimestamp(float(raw), tz=timezone.utc).replace(tzinfo=None)
+                except ValueError:
+                    return None
+            try:
+                parsed = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            except ValueError:
+                return None
+            return self._to_utc_naive(parsed)
+        return None
 
     def _extract_price(self, market: Dict) -> float:
         outcomes = market.get('outcomes') or []
@@ -389,7 +421,13 @@ class PolymarketCollector:
 
         return 'other'
 
-    def _fetch_public_trades_pages(self, pages: int = 2, limit: int = 500, taker_only: bool = False) -> List[Dict]:
+    def _fetch_public_trades_pages(
+        self,
+        pages: int = 2,
+        limit: int = 500,
+        taker_only: bool = False,
+        since: Optional[datetime] = None
+    ) -> List[Dict]:
         """Fetch public trade pages (global feed) from Polymarket data API."""
         trades = []
         for page in range(pages):
@@ -403,10 +441,24 @@ class PolymarketCollector:
             if response.status_code != 200:
                 logger.warning(f"Failed to fetch public trades page {page}: {response.status_code}")
                 break
-            payload = response.json()
+            payload = response.json() or []
             if not payload:
                 break
-            trades.extend(payload)
+            oldest_ts = None
+            filtered_payload = []
+            for trade in payload:
+                parsed_ts = self._parse_trade_timestamp(trade.get("timestamp") or trade.get("created_at"))
+                if parsed_ts:
+                    trade["_parsed_timestamp"] = parsed_ts
+                    if oldest_ts is None or parsed_ts < oldest_ts:
+                        oldest_ts = parsed_ts
+                if since:
+                    if not parsed_ts or parsed_ts < since:
+                        continue
+                filtered_payload.append(trade)
+            trades.extend(filtered_payload if since else payload)
+            if since and oldest_ts and oldest_ts < since:
+                break
             if len(payload) < limit:
                 break
         return trades
@@ -449,10 +501,15 @@ class PolymarketCollector:
             return fallback, "fixed"
         return self._percentile(values, percentile), "percentile"
 
-    def get_trades_for_conditions(self, condition_ids: set, pages: int = 2) -> Dict[str, List[Dict]]:
+    def get_trades_for_conditions(
+        self,
+        condition_ids: set,
+        pages: int = 2,
+        since: Optional[datetime] = None
+    ) -> Dict[str, List[Dict]]:
         """Fetch public trades and group by conditionId."""
         grouped = {cid: [] for cid in condition_ids}
-        trades = self._fetch_public_trades_pages(pages=pages)
+        trades = self._fetch_public_trades_pages(pages=pages, since=since)
 
         for trade in trades:
             condition_id = trade.get("conditionId")
@@ -461,11 +518,14 @@ class PolymarketCollector:
 
             price = self._safe_float(trade.get('price', 0), 0.0)
             quantity = self._safe_float(trade.get('size', trade.get('quantity', 0)), 0.0)
-            raw_ts = trade.get('timestamp') or trade.get('created_at')
-            if isinstance(raw_ts, (int, float)):
-                timestamp = datetime.fromtimestamp(raw_ts, tz=timezone.utc).isoformat()
-            else:
-                timestamp = raw_ts
+            timestamp_dt = trade.get("_parsed_timestamp") or self._parse_trade_timestamp(
+                trade.get('timestamp') or trade.get('created_at')
+            )
+            if since and (not timestamp_dt or timestamp_dt < since):
+                continue
+            if not timestamp_dt:
+                continue
+            timestamp = timestamp_dt.replace(tzinfo=timezone.utc).isoformat()
 
             grouped[condition_id].append({
                 'timestamp': timestamp,
@@ -479,7 +539,14 @@ class PolymarketCollector:
 
         return grouped
 
-    def collect_comprehensive_data(self, categories=None, markets_per_category=10, include_trades=True, trade_pages: int = 2):
+    def collect_comprehensive_data(
+        self,
+        categories=None,
+        markets_per_category=10,
+        include_trades=True,
+        trade_pages: int = 2,
+        trade_lookback_days: Optional[int] = None
+    ):
         """Collect comprehensive market data with trades"""
         logger.info("🚀 Starting comprehensive data collection...")
 
@@ -496,7 +563,14 @@ class PolymarketCollector:
         condition_trade_map = {}
         if include_trades and markets:
             condition_ids = {m.get("condition_id") for m in markets if m.get("condition_id")}
-            condition_trade_map = self.get_trades_for_conditions(condition_ids, pages=trade_pages)
+            if trade_lookback_days is None:
+                trade_lookback_days = TRADE_LOOKBACK_DAYS_FULL
+            since = self._utc_now() - timedelta(days=trade_lookback_days)
+            condition_trade_map = self.get_trades_for_conditions(
+                condition_ids,
+                pages=trade_pages,
+                since=since
+            )
 
         # Group markets by category
         for market in markets:
@@ -563,7 +637,9 @@ class PolymarketCollector:
         for trade in trades:
             if 'timestamp' in trade:
                 try:
-                    dt = datetime.fromisoformat(trade['timestamp'].replace('Z', '+00:00'))
+                    dt = self._parse_trade_timestamp(trade.get('timestamp'))
+                    if not dt:
+                        continue
                     hour = dt.hour
                     hour_counts[hour] = hour_counts.get(hour, 0) + 1
                 except:
@@ -714,13 +790,15 @@ class PolymarketCollector:
             
             # Calculate average trade size
             avg_trade_size = volume_24h / max(num_trades, 1) if volume_24h > 0 else 0
+            if num_trades < RETAIL_MIN_TRADES:
+                avg_trade_size = None
             
             # Count large trades (rough estimation - trades > $1000)
             large_trade_threshold = 1000
             estimated_large_trades = max(0, int(volume_24h / large_trade_threshold) - 1) if volume_24h > large_trade_threshold else 0
             
             # Determine temporal patterns for retail analysis
-            now = datetime.now(datetime.UTC) if hasattr(datetime, 'UTC') else datetime.utcnow()
+            now = self._utc_now()
             hour_of_day = now.hour
             is_weekend = now.weekday() >= 5  # Saturday = 5, Sunday = 6
             is_evening = hour_of_day >= 18 or hour_of_day <= 5  # After 6 PM or before 6 AM ET

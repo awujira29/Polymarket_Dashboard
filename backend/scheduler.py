@@ -9,6 +9,8 @@ import threading
 from config import (
     TRACKED_CATEGORIES,
     TRADE_PAGES,
+    TRADE_LOOKBACK_DAYS_FAST,
+    TRADE_LOOKBACK_DAYS_FULL,
     RETAIL_SIZE_PERCENTILES,
     RETAIL_MIN_TRADES,
     RETAIL_FALLBACK_THRESHOLD
@@ -53,7 +55,14 @@ class ContinuousDataCollector:
         self.is_running = False
         self.collection_thread = None
 
-    def collect_comprehensive_data(self, categories=None, markets_per_category=15, include_trades=True):
+    def collect_comprehensive_data(
+        self,
+        categories=None,
+        markets_per_category=15,
+        include_trades=True,
+        trade_pages=TRADE_PAGES,
+        trade_lookback_days=None
+    ):
         """Collect comprehensive market and trade data"""
         start_time = datetime.now(timezone.utc)
 
@@ -65,7 +74,8 @@ class ContinuousDataCollector:
                 categories=categories,
                 markets_per_category=markets_per_category,
                 include_trades=include_trades,
-                trade_pages=TRADE_PAGES if include_trades else 0
+                trade_pages=trade_pages if include_trades else 0,
+                trade_lookback_days=trade_lookback_days
             )
 
             # Store in database
@@ -89,6 +99,7 @@ class ContinuousDataCollector:
                             # Create new market
                             market = Market(
                                 id=market_data['id'],
+                                condition_id=market_data.get('condition_id') or market_data.get('conditionId'),
                                 title=market_data['question'],
                                 category=category,
                                 event_title=market_data['event_title'],
@@ -102,14 +113,18 @@ class ContinuousDataCollector:
                             # Update existing market
                             market.category = category
                             market.event_tags = market_data['event_tags']
+                            if market_data.get('condition_id') and not market.condition_id:
+                                market.condition_id = market_data.get('condition_id')
 
                         # Create snapshot
                         volume_24h = market_data.get('volume_24h', 0)
                         volume_num_trades = market_data.get('trade_count', 0)
-                        avg_trade_size = market_data.get('avg_trade_size', 0)
-                        if not avg_trade_size and volume_24h and volume_num_trades:
+                        avg_trade_size = market_data.get('avg_trade_size')
+                        if not avg_trade_size and volume_num_trades:
                             avg_trade_size = volume_24h / max(volume_num_trades, 1)
-                        now = datetime.now(timezone.utc)
+                        if not volume_num_trades or volume_num_trades < RETAIL_MIN_TRADES:
+                            avg_trade_size = None
+                        now = datetime.now(timezone.utc).replace(tzinfo=None)
                         snapshot = MarketSnapshot(
                             market_id=market_data['id'],
                             price=market_data['price'],
@@ -128,17 +143,20 @@ class ContinuousDataCollector:
                             trade_values = [t['value'] for t in market_data['recent_trades']]
                             trade_threshold, _ = _retail_threshold(trade_values, category)
                             for trade_data in market_data['recent_trades']:
+                                timestamp = self.collector._parse_trade_timestamp(trade_data.get('timestamp'))
+                                if not timestamp:
+                                    continue
                                 # Check if trade already exists (avoid duplicates)
                                 existing_trade = session.query(Trade).filter_by(
                                     market_id=market_data['id'],
-                                    timestamp=datetime.fromisoformat(trade_data['timestamp'].replace('Z', '+00:00')) if trade_data['timestamp'] else None,
+                                    timestamp=timestamp,
                                     value=trade_data['value']
                                 ).first()
 
                                 if not existing_trade:
                                     trade = Trade(
                                         market_id=market_data['id'],
-                                        timestamp=datetime.fromisoformat(trade_data['timestamp'].replace('Z', '+00:00')) if trade_data['timestamp'] else datetime.utcnow(),
+                                        timestamp=timestamp,
                                         price=trade_data['price'],
                                         quantity=trade_data['quantity'],
                                         side=trade_data['side'],
@@ -183,7 +201,9 @@ class ContinuousDataCollector:
         self.collect_comprehensive_data(
             categories=TRACKED_CATEGORIES,
             markets_per_category=12,
-            include_trades=True
+            include_trades=True,
+            trade_pages=min(TRADE_PAGES, 10),
+            trade_lookback_days=TRADE_LOOKBACK_DAYS_FAST
         )
 
     def collect_comprehensive_update(self):
@@ -192,7 +212,9 @@ class ContinuousDataCollector:
         self.collect_comprehensive_data(
             categories=TRACKED_CATEGORIES,
             markets_per_category=25,
-            include_trades=True
+            include_trades=True,
+            trade_pages=TRADE_PAGES,
+            trade_lookback_days=TRADE_LOOKBACK_DAYS_FULL
         )
 
     def start_continuous_collection(self):

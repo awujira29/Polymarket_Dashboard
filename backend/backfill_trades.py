@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fetch_polymarket import PolymarketCollector
 from database import init_db, get_db_session
@@ -10,7 +10,8 @@ from config import (
     TRACKED_CATEGORIES,
     RETAIL_SIZE_PERCENTILES,
     RETAIL_MIN_TRADES,
-    RETAIL_FALLBACK_THRESHOLD
+    RETAIL_FALLBACK_THRESHOLD,
+    TRADE_LOOKBACK_DAYS_FULL
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +49,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Backfill public Polymarket trades")
     parser.add_argument("--pages", type=int, default=20, help="Number of pages to fetch (limit=500 per page)")
     parser.add_argument("--limit", type=int, default=500, help="Trades per page")
+    parser.add_argument("--days", type=int, default=TRADE_LOOKBACK_DAYS_FULL, help="Lookback window in days")
     parser.add_argument("--taker-only", action="store_true", help="Use takerOnly=true on public feed")
     parser.add_argument("--dry-run", action="store_true", help="Fetch trades without writing to DB")
     return parser.parse_args()
@@ -94,10 +96,12 @@ def main():
             logger.warning("No markets with condition_id found for tracked categories.")
             return
 
+        since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=args.days)
         trades = collector._fetch_public_trades_pages(
             pages=args.pages,
             limit=args.limit,
-            taker_only=args.taker_only
+            taker_only=args.taker_only,
+            since=since
         )
 
         logger.info("Fetched %s trades from public feed", len(trades))
@@ -110,14 +114,9 @@ def main():
 
             price = collector._safe_float(trade.get("price", 0), 0.0)
             quantity = collector._safe_float(trade.get("size", trade.get("quantity", 0)), 0.0)
-            raw_ts = trade.get("timestamp") or trade.get("created_at")
-            if isinstance(raw_ts, (int, float)):
-                timestamp = datetime.fromtimestamp(raw_ts, tz=timezone.utc)
-            else:
-                try:
-                    timestamp = datetime.fromisoformat(raw_ts)
-                except Exception:
-                    timestamp = datetime.now(timezone.utc)
+            timestamp = collector._parse_trade_timestamp(trade.get("timestamp") or trade.get("created_at"))
+            if not timestamp or timestamp < since:
+                continue
 
             value = price * quantity
             market_id = condition_map[condition_id]
