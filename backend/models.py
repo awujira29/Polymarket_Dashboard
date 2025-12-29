@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, Integer, DateTime, ForeignKey, Text, Boolean, JSON
+from sqlalchemy import Column, String, Float, Integer, DateTime, ForeignKey, Text, Boolean, JSON, Date, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -121,3 +121,40 @@ class DataCollectionRun(Base):
 
     def __repr__(self):
         return f"<DataCollectionRun(timestamp={self.timestamp}, total_markets={self.total_markets}, status={self.status})>"
+
+
+class RetailRollup(Base):
+    __tablename__ = "retail_rollups"
+    __table_args__ = (
+        UniqueConstraint("date", "category", name="uq_retail_rollup_date_category"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(Date, index=True)
+    category = Column(String, index=True)
+
+    total_trades = Column(Integer, default=0)
+    total_volume = Column(Float, default=0)
+    avg_trade_size = Column(Float, nullable=True)
+    retail_trade_share = Column(Float, nullable=True)
+    retail_volume_share = Column(Float, nullable=True)
+    small_trade_share = Column(Float, nullable=True)
+    evening_share = Column(Float, nullable=True)
+    weekend_share = Column(Float, nullable=True)
+    burstiness = Column(Float, nullable=True)
+    flow_score = Column(Float, nullable=True)
+    attention_score = Column(Float, nullable=True)
+    retail_score = Column(Float, nullable=True)
+    retail_level = Column(String, nullable=True)
+    whale_share = Column(Float, nullable=True)
+    whale_dominated = Column(Boolean, default=False)
+    trade_threshold = Column(Float, nullable=True)
+    trade_threshold_method = Column(String, nullable=True)
+    markets_covered = Column(Integer, default=0)
+    quality_markets = Column(Integer, default=0)
+    confidence_label = Column(String, default="insufficient")
+    confidence_score = Column(Float, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<RetailRollup(date={self.date}, category={self.category}, trades={self.total_trades})>"

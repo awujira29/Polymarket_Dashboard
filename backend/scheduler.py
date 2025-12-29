@@ -13,8 +13,10 @@ from config import (
     TRADE_LOOKBACK_DAYS_FULL,
     RETAIL_SIZE_PERCENTILES,
     RETAIL_MIN_TRADES,
-    RETAIL_FALLBACK_THRESHOLD
+    RETAIL_FALLBACK_THRESHOLD,
+    ROLLUP_DAYS
 )
+from rollup_retail import build_retail_rollups
 
 logging.basicConfig(
     level=logging.INFO,
@@ -216,6 +218,10 @@ class ContinuousDataCollector:
             trade_pages=TRADE_PAGES,
             trade_lookback_days=TRADE_LOOKBACK_DAYS_FULL
         )
+        try:
+            build_retail_rollups(days=ROLLUP_DAYS)
+        except Exception as exc:
+            logger.error("Rollup build failed: %s", exc)
 
     def start_continuous_collection(self):
         """Start the continuous data collection scheduler"""

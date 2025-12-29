@@ -8,6 +8,8 @@ sys.path.append(str(BASE_DIR))
 
 from database import init_db
 from scheduler import ContinuousDataCollector
+from rollup_retail import build_retail_rollups
+from config import ROLLUP_DAYS
 
 
 def main():
@@ -20,10 +22,12 @@ def main():
         return
     if mode in ("comprehensive", "full", "hourly"):
         collector.collect_comprehensive_update()
+        build_retail_rollups(days=ROLLUP_DAYS)
         return
 
     collector.collect_high_frequency_data()
     collector.collect_comprehensive_update()
+    build_retail_rollups(days=ROLLUP_DAYS)
 
 
 if __name__ == "__main__":

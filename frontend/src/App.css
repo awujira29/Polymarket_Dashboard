@@ -66,6 +66,34 @@
   margin-bottom: 24px;
 }
 
+.panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.trend-section {
+  margin-top: 24px;
+}
+
+.trend-panel .controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.trend-metrics .metric-card {
+  min-height: 140px;
+}
+
+.trend-chart-grid {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
 .metric-card {
   display: flex;
   flex-direction: column;

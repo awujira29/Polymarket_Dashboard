@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import desc, func
 from database import get_db_session, init_db
-from models import Market, MarketSnapshot, Trade, DataCollectionRun
+from models import Market, MarketSnapshot, Trade, DataCollectionRun, RetailRollup
 from retail_analyzer import RetailBehaviorAnalyzer
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
@@ -1530,6 +1530,75 @@ def get_analytics_overview():
             "timestamp": _to_utc_iso(datetime.utcnow())
         }
     
+    finally:
+        db.close()
+
+@app.get("/analytics/retail-index")
+def get_retail_index(days: int = 180, category: str = "all"):
+    """Long-term retail index rollups."""
+    db = get_db_session()
+
+    try:
+        category_norm = _normalize_category(category) if category else "all"
+        if category_norm in ("all", "overall"):
+            category_norm = "all"
+
+        end_date = datetime.utcnow().date()
+        start_date = end_date - timedelta(days=max(days - 1, 0))
+
+        query = db.query(RetailRollup)\
+            .filter(RetailRollup.date >= start_date)\
+            .filter(RetailRollup.date <= end_date)\
+            .filter(RetailRollup.category == category_norm)\
+            .order_by(RetailRollup.date)
+
+        rows = query.all()
+        series = [
+            {
+                "date": r.date.isoformat(),
+                "retail_score": r.retail_score,
+                "retail_level": r.retail_level,
+                "flow_score": r.flow_score,
+                "attention_score": r.attention_score,
+                "retail_trade_share": r.retail_trade_share,
+                "retail_volume_share": r.retail_volume_share,
+                "avg_trade_size": r.avg_trade_size,
+                "total_trades": r.total_trades,
+                "total_volume": r.total_volume,
+                "whale_share": r.whale_share,
+                "whale_dominated": r.whale_dominated,
+                "markets_covered": r.markets_covered,
+                "quality_markets": r.quality_markets,
+                "confidence_label": r.confidence_label,
+                "confidence_score": r.confidence_score
+            }
+            for r in rows
+        ]
+
+        summary = {}
+        if rows:
+            latest = rows[-1]
+            summary = {
+                "latest_date": latest.date.isoformat(),
+                "latest_retail_score": latest.retail_score,
+                "latest_flow_score": latest.flow_score,
+                "latest_attention_score": latest.attention_score,
+                "latest_retail_trade_share": latest.retail_trade_share,
+                "latest_retail_volume_share": latest.retail_volume_share,
+                "latest_whale_share": latest.whale_share,
+                "latest_total_trades": latest.total_trades,
+                "latest_total_volume": latest.total_volume,
+                "markets_covered": latest.markets_covered,
+                "quality_markets": latest.quality_markets,
+                "confidence_label": latest.confidence_label
+            }
+
+        return {
+            "category": category_norm,
+            "days": days,
+            "series": series,
+            "summary": summary
+        }
     finally:
         db.close()
 

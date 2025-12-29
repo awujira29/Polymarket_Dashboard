@@ -113,6 +113,11 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [trendCategory, setTrendCategory] = useState('all');
+  const [trendDays, setTrendDays] = useState(180);
+  const [trendSeries, setTrendSeries] = useState([]);
+  const [trendSummary, setTrendSummary] = useState(null);
+  const [trendLoading, setTrendLoading] = useState(true);
 
   const fetchJson = async (url) => {
     const response = await fetch(url);
@@ -165,11 +170,25 @@ export default function App() {
     setMarketTrades(tradesData);
   };
 
+  const loadTrend = async (category = trendCategory, days = trendDays) => {
+    setTrendLoading(true);
+    const params = new URLSearchParams();
+    params.set('category', category);
+    params.set('days', String(days));
+    try {
+      const data = await fetchJson(`${API_BASE}/analytics/retail-index?${params.toString()}`);
+      setTrendSeries(data.series || []);
+      setTrendSummary(data.summary || null);
+    } finally {
+      setTrendLoading(false);
+    }
+  };
+
   const refreshAll = async () => {
     setRefreshing(true);
     setError('');
     try {
-      await Promise.all([loadOverview(), loadMarkets(selectedCategory)]);
+      await Promise.all([loadOverview(), loadMarkets(selectedCategory), loadTrend()]);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -182,7 +201,7 @@ export default function App() {
       setLoading(true);
       setError('');
       try {
-        await Promise.all([loadOverview(), loadMarkets(selectedCategory)]);
+        await Promise.all([loadOverview(), loadMarkets(selectedCategory), loadTrend()]);
       } catch (err) {
         setError(err.message);
       } finally {
@@ -203,6 +222,12 @@ export default function App() {
       loadMarkets(selectedCategory).catch((err) => setError(err.message));
     }
   }, [hideWhales]);
+
+  useEffect(() => {
+    if (!loading) {
+      loadTrend(trendCategory, trendDays).catch((err) => setError(err.message));
+    }
+  }, [trendCategory, trendDays]);
 
   useEffect(() => {
     if (selectedMarketId) {
@@ -279,6 +304,21 @@ export default function App() {
   const tradeSizeData = useMemo(() => {
     return marketTrades?.trade_size_distribution || [];
   }, [marketTrades]);
+
+  const trendChartData = useMemo(() => {
+    return trendSeries.map((point) => ({
+      date: new Date(point.date).toLocaleDateString('en-US', {
+        month: 'short',
+        day: '2-digit'
+      }),
+      retailScore: point.retail_score ?? null,
+      flowIndex: point.flow_score !== null && point.flow_score !== undefined ? point.flow_score * 10 : null,
+      attentionIndex: point.attention_score !== null && point.attention_score !== undefined ? point.attention_score * 10 : null,
+      retailShare: point.retail_trade_share ?? null,
+      whaleShare: point.whale_share ?? null,
+      trades: point.total_trades ?? 0
+    }));
+  }, [trendSeries]);
 
   const detailCoverageNote = useMemo(() => {
     const signals = marketDetail?.retail_signals;
@@ -795,6 +835,147 @@ export default function App() {
                 </div>
               </div>
             </>
+          )}
+        </div>
+      </section>
+
+      <section className="trend-section">
+        <div className="panel trend-panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Long-term signal</p>
+              <h2 className="section-title">Retail trend index</h2>
+              <p className="hint">Daily rollups for flow vs attention across categories.</p>
+            </div>
+            <div className="controls">
+              <div className="select-field">
+                <select
+                  value={trendCategory}
+                  onChange={(event) => setTrendCategory(event.target.value)}
+                >
+                  <option value="all">All categories</option>
+                  {categories.map((cat) => (
+                    <option key={cat.category} value={cat.category}>
+                      {cat.category}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="toggle-group">
+                {[30, 90, 180].map((days) => (
+                  <button
+                    key={days}
+                    className={`toggle-btn ${trendDays === days ? 'active' : ''}`}
+                    onClick={() => setTrendDays(days)}
+                    type="button"
+                  >
+                    {days}d
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="metrics-grid trend-metrics">
+            <div className="panel metric-card">
+              <div className="metric-header">
+                <TrendingUp className="icon" />
+                Retail score
+              </div>
+              <div className="metric-value">
+                {trendSummary?.latest_retail_score?.toFixed(2) ?? '--'}
+              </div>
+              <p className="hint">Latest daily index</p>
+            </div>
+            <div className="panel metric-card">
+              <div className="metric-header">
+                <Zap className="icon" />
+                Flow vs attention
+              </div>
+              <div className="metric-value">
+                {(trendSummary?.latest_flow_score ?? 0).toFixed(2)} / {(trendSummary?.latest_attention_score ?? 0).toFixed(2)}
+              </div>
+              <p className="hint">Flow / attention scores</p>
+            </div>
+            <div className="panel metric-card">
+              <div className="metric-header">
+                <Activity className="icon" />
+                Retail share
+              </div>
+              <div className="metric-value">
+                {formatPercent(trendSummary?.latest_retail_trade_share)}
+              </div>
+              <p className="hint">Daily retail trade share</p>
+            </div>
+            <div className="panel metric-card">
+              <div className="metric-header">
+                <BarChart3 className="icon" />
+                Whale share
+              </div>
+              <div className="metric-value">
+                {formatPercent(trendSummary?.latest_whale_share)}
+              </div>
+              <p className="hint">Top 1% volume share</p>
+            </div>
+          </div>
+
+          <div className="chart-grid trend-chart-grid">
+            <div className="chart-card">
+              <div className="chart-header">
+                <span>Retail index (daily)</span>
+                <span className="hint">{trendDays} day view</span>
+              </div>
+              <div className="chart-body">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={trendChartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.08)" />
+                    <XAxis dataKey="date" />
+                    <YAxis />
+                    <Tooltip
+                      formatter={(value, name) => {
+                        if (name === 'retailScore') return [value?.toFixed(2), 'Retail score'];
+                        if (name === 'flowIndex') return [value?.toFixed(2), 'Flow index'];
+                        if (name === 'attentionIndex') return [value?.toFixed(2), 'Attention index'];
+                        return [value, name];
+                      }}
+                    />
+                    <Area type="monotone" dataKey="retailScore" fill="#d1495b33" stroke="#d1495b" />
+                    <Line type="monotone" dataKey="flowIndex" stroke="#1b998b" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="attentionIndex" stroke="#f2b134" strokeWidth={2} dot={false} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div className="chart-card">
+              <div className="chart-header">
+                <span>Participation + whales</span>
+                <span className="hint">Trade count vs whale share</span>
+              </div>
+              <div className="chart-body">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={trendChartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.08)" />
+                    <XAxis dataKey="date" />
+                    <YAxis yAxisId="left" />
+                    <YAxis yAxisId="right" orientation="right" />
+                    <Tooltip
+                      formatter={(value, name) => {
+                        if (name === 'trades') return [formatNumber(value), 'Trades'];
+                        if (name === 'whaleShare') return [formatPercent(value), 'Whale share'];
+                        return [value, name];
+                      }}
+                    />
+                    <Bar yAxisId="left" dataKey="trades" fill="#2d7dd2" radius={[6, 6, 0, 0]} />
+                    <Line yAxisId="right" type="monotone" dataKey="whaleShare" stroke="#8f5d2e" strokeWidth={2} dot={false} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+
+          {trendLoading && (
+            <div className="coverage-note">Loading rollup data…</div>
           )}
         </div>
       </section>
