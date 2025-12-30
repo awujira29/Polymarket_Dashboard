@@ -70,6 +70,64 @@ const formatTimestamp = (value) => {
   });
 };
 
+const STALE_SNAPSHOT_HOURS = 24;
+
+const isTruthyFlag = (value) => {
+  if (value === true) return true;
+  if (value === false || value === null || value === undefined) return false;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'y';
+  }
+  return false;
+};
+
+const isMarketClosed = (market) => {
+  if (!market) return false;
+  if (isTruthyFlag(market.closed) || isTruthyFlag(market.archived)) return true;
+  const status = typeof market.status === 'string' ? market.status.trim().toLowerCase() : '';
+  return status === 'inactive' || status === 'closed';
+};
+
+const hoursSince = (value) => {
+  if (!value) return null;
+  const ts = new Date(value);
+  if (Number.isNaN(ts.getTime())) return null;
+  return (Date.now() - ts.getTime()) / 36e5;
+};
+
+const formatRollupDate = (value) => {
+  if (!value) return '--';
+  const parts = String(value).split('-');
+  if (parts.length !== 3) return value;
+  const monthIndex = Number(parts[1]) - 1;
+  const day = parts[2];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const monthLabel = months[monthIndex];
+  if (!monthLabel) return value;
+  return `${monthLabel} ${day}`;
+};
+
+const formatHourlyLabel = (value) => {
+  if (!value) return '--';
+  return new Date(value).toLocaleString('en-US', {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+};
+
+const TREND_RANGES = [
+  { label: '24h', mode: 'hourly', hours: 24 },
+  { label: '72h', mode: 'hourly', hours: 72 },
+  { label: '7d', mode: 'daily', days: 7 },
+  { label: '30d', mode: 'daily', days: 30 },
+  { label: '90d', mode: 'daily', days: 90 },
+  { label: '180d', mode: 'daily', days: 180 }
+];
+
 const getCategoryColor = (category) => {
   const colors = {
     politics: '#d1495b',
@@ -115,6 +173,8 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [trendCategory, setTrendCategory] = useState('all');
   const [trendDays, setTrendDays] = useState(180);
+  const [trendHours, setTrendHours] = useState(24);
+  const [trendGranularity, setTrendGranularity] = useState('daily');
   const [trendSeries, setTrendSeries] = useState([]);
   const [trendSummary, setTrendSummary] = useState(null);
   const [trendLoading, setTrendLoading] = useState(true);
@@ -170,13 +230,24 @@ export default function App() {
     setMarketTrades(tradesData);
   };
 
-  const loadTrend = async (category = trendCategory, days = trendDays) => {
+  const loadTrend = async (
+    category = trendCategory,
+    granularity = trendGranularity,
+    days = trendDays,
+    hours = trendHours
+  ) => {
     setTrendLoading(true);
-    const params = new URLSearchParams();
-    params.set('category', category);
-    params.set('days', String(days));
     try {
-      const data = await fetchJson(`${API_BASE}/analytics/retail-index?${params.toString()}`);
+      const params = new URLSearchParams();
+      params.set('category', category);
+      let endpoint = '/analytics/retail-index';
+      if (granularity === 'hourly') {
+        endpoint = '/analytics/retail-index/hourly';
+        params.set('hours', String(hours));
+      } else {
+        params.set('days', String(days));
+      }
+      const data = await fetchJson(`${API_BASE}${endpoint}?${params.toString()}`);
       setTrendSeries(data.series || []);
       setTrendSummary(data.summary || null);
     } finally {
@@ -225,9 +296,10 @@ export default function App() {
 
   useEffect(() => {
     if (!loading) {
-      loadTrend(trendCategory, trendDays).catch((err) => setError(err.message));
+      loadTrend(trendCategory, trendGranularity, trendDays, trendHours)
+        .catch((err) => setError(err.message));
     }
-  }, [trendCategory, trendDays]);
+  }, [trendCategory, trendGranularity, trendDays, trendHours]);
 
   useEffect(() => {
     if (selectedMarketId) {
@@ -307,10 +379,9 @@ export default function App() {
 
   const trendChartData = useMemo(() => {
     return trendSeries.map((point) => ({
-      date: new Date(point.date).toLocaleDateString('en-US', {
-        month: 'short',
-        day: '2-digit'
-      }),
+      date: trendGranularity === 'hourly'
+        ? formatHourlyLabel(point.timestamp)
+        : formatRollupDate(point.date),
       retailScore: point.retail_score ?? null,
       flowIndex: point.flow_score !== null && point.flow_score !== undefined ? point.flow_score * 10 : null,
       attentionIndex: point.attention_score !== null && point.attention_score !== undefined ? point.attention_score * 10 : null,
@@ -318,7 +389,21 @@ export default function App() {
       whaleShare: point.whale_share ?? null,
       trades: point.total_trades ?? 0
     }));
-  }, [trendSeries]);
+  }, [trendSeries, trendGranularity]);
+
+  const flowMetric = useMemo(() => {
+    if (typeof trendSummary?.latest_flow_score === 'number') {
+      return trendSummary.latest_flow_score.toFixed(2);
+    }
+    return '--';
+  }, [trendSummary]);
+
+  const attentionMetric = useMemo(() => {
+    if (typeof trendSummary?.latest_attention_score === 'number') {
+      return trendSummary.latest_attention_score.toFixed(2);
+    }
+    return '--';
+  }, [trendSummary]);
 
   const detailCoverageNote = useMemo(() => {
     const signals = marketDetail?.retail_signals;
@@ -333,6 +418,23 @@ export default function App() {
     if (!label || label === 'insufficient') return '';
     return `Confidence: ${label}`;
   }, [marketDetail]);
+
+  const detailIsClosed = useMemo(() => isMarketClosed(marketDetail?.market), [marketDetail]);
+
+  const staleNote = useMemo(() => {
+    const latestTimestamp = marketDetail?.latest?.timestamp;
+    if (!latestTimestamp) return '';
+    const hours = hoursSince(latestTimestamp);
+    if (hours === null) return '';
+    if (detailIsClosed) {
+      return `Market marked closed. Data frozen since ${formatTimestamp(latestTimestamp)}.`;
+    }
+    if (hours >= STALE_SNAPSHOT_HOURS) {
+      const rounded = Math.round(hours);
+      return `No fresh snapshots in ~${rounded}h. Market may be closed or inactive; treat signals as stale.`;
+    }
+    return '';
+  }, [marketDetail, detailIsClosed]);
 
   const qualityNote = useMemo(() => {
     const signals = marketDetail?.retail_signals;
@@ -558,6 +660,7 @@ export default function App() {
           <div className="market-list-body">
             {filteredMarkets.map((market) => {
               const retailStatus = resolveRetailStatus(market.retail_signals);
+              const marketClosed = isMarketClosed(market);
               return (
               <button
                 key={market.id}
@@ -569,6 +672,7 @@ export default function App() {
                   <div className="market-meta">
                     <span className="category-dot" style={{ backgroundColor: getCategoryColor(market.category) }} />
                     <span>{market.category}</span>
+                    {marketClosed && <span className="status-pill closed">Closed</span>}
                     <span>•</span>
                     <span>{formatTimestamp(market.last_updated)}</span>
                     <span>•</span>
@@ -643,6 +747,7 @@ export default function App() {
                       marketDetail.retail_signals.sample_trades
                     )}
                   </span>
+                  {detailIsClosed && <span className="status-pill closed">Closed</span>}
                   {detailConfidenceLabel && <span className="hint">{detailConfidenceLabel}</span>}
                 </div>
               </div>
@@ -676,6 +781,9 @@ export default function App() {
 
               {detailCoverageNote && (
                 <div className="coverage-note">{detailCoverageNote}</div>
+              )}
+              {staleNote && (
+                <div className="coverage-note warning">{staleNote}</div>
               )}
               {qualityNote && (
                 <div className="coverage-note warning">{qualityNote}</div>
@@ -862,16 +970,28 @@ export default function App() {
                 </select>
               </div>
               <div className="toggle-group">
-                {[30, 90, 180].map((days) => (
-                  <button
-                    key={days}
-                    className={`toggle-btn ${trendDays === days ? 'active' : ''}`}
-                    onClick={() => setTrendDays(days)}
-                    type="button"
-                  >
-                    {days}d
-                  </button>
-                ))}
+                {TREND_RANGES.map((range) => {
+                  const isActive = range.mode === 'hourly'
+                    ? trendGranularity === 'hourly' && trendHours === range.hours
+                    : trendGranularity === 'daily' && trendDays === range.days;
+                  return (
+                    <button
+                      key={range.label}
+                      className={`toggle-btn ${isActive ? 'active' : ''}`}
+                      onClick={() => {
+                        setTrendGranularity(range.mode);
+                        if (range.mode === 'hourly') {
+                          setTrendHours(range.hours);
+                        } else {
+                          setTrendDays(range.days);
+                        }
+                      }}
+                      type="button"
+                    >
+                      {range.label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -885,7 +1005,9 @@ export default function App() {
               <div className="metric-value">
                 {trendSummary?.latest_retail_score?.toFixed(2) ?? '--'}
               </div>
-              <p className="hint">Latest daily index</p>
+              <p className="hint">
+                Latest {trendGranularity === 'hourly' ? 'hourly' : 'daily'} index
+              </p>
             </div>
             <div className="panel metric-card">
               <div className="metric-header">
@@ -893,7 +1015,7 @@ export default function App() {
                 Flow vs attention
               </div>
               <div className="metric-value">
-                {(trendSummary?.latest_flow_score ?? 0).toFixed(2)} / {(trendSummary?.latest_attention_score ?? 0).toFixed(2)}
+                {flowMetric} / {attentionMetric}
               </div>
               <p className="hint">Flow / attention scores</p>
             </div>
@@ -905,7 +1027,9 @@ export default function App() {
               <div className="metric-value">
                 {formatPercent(trendSummary?.latest_retail_trade_share)}
               </div>
-              <p className="hint">Daily retail trade share</p>
+              <p className="hint">
+                {trendGranularity === 'hourly' ? 'Hourly' : 'Daily'} retail trade share
+              </p>
             </div>
             <div className="panel metric-card">
               <div className="metric-header">
@@ -922,8 +1046,12 @@ export default function App() {
           <div className="chart-grid trend-chart-grid">
             <div className="chart-card">
               <div className="chart-header">
-                <span>Retail index (daily)</span>
-                <span className="hint">{trendDays} day view</span>
+                <span>Retail index ({trendGranularity === 'hourly' ? 'hourly' : 'daily'})</span>
+                <span className="hint">
+                  {trendGranularity === 'hourly'
+                    ? `${trendHours}h view`
+                    : `${trendDays} day view`}
+                </span>
               </div>
               <div className="chart-body">
                 <ResponsiveContainer width="100%" height="100%">

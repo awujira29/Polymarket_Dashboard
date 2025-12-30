@@ -62,6 +62,17 @@ def _normalize_category(value: str | None) -> str:
         return "uncategorized"
     return str(value).strip().lower()
 
+def _truthy_flag(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    return False
+
 def _tracked_categories_set() -> set[str]:
     if not TRACKED_CATEGORIES:
         return set()
@@ -734,6 +745,9 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30, h
                 "category": _normalize_category(market.category),
                 "description": market.description,
                 "end_date": market.end_date_iso,
+                "closed": _truthy_flag(market.closed),
+                "archived": _truthy_flag(market.archived),
+                "status": market.status,
                 "price": latest.price,
                 "volume_24h": latest.volume_24h,
                 "liquidity": latest.liquidity,
@@ -901,6 +915,9 @@ def get_market_detail(market_id: str, hours: int = 24):
                 "subcategory": market.subcategory,
                 "description": market.description,
                 "end_date": market.end_date_iso,
+                "closed": _truthy_flag(market.closed),
+                "archived": _truthy_flag(market.archived),
+                "status": market.status,
                 "event_title": market.event_title,
                 "event_tags": market.event_tags,
                 "outcomes": market.outcomes
@@ -1598,6 +1615,151 @@ def get_retail_index(days: int = 180, category: str = "all"):
             "days": days,
             "series": series,
             "summary": summary
+        }
+    finally:
+        db.close()
+
+@app.get("/analytics/retail-index/hourly")
+def get_retail_index_hourly(hours: int = 72, category: str = "all"):
+    """Short-term retail index rollups (hourly)."""
+    db = get_db_session()
+
+    try:
+        category_norm = _normalize_category(category) if category else "all"
+        if category_norm in ("all", "overall"):
+            category_norm = "all"
+
+        hours = max(hours, 1)
+        end_hour = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        start_hour = end_hour - timedelta(hours=hours - 1)
+
+        trade_query = db.query(Trade).filter(Trade.timestamp >= start_hour)
+        if category_norm != "all":
+            market_ids = [
+                row[0] for row in db.query(Market.id)
+                .filter(func.lower(Market.category) == category_norm)
+                .all()
+            ]
+            if not market_ids:
+                return {
+                    "category": category_norm,
+                    "hours": hours,
+                    "series": [],
+                    "summary": {},
+                    "granularity": "hourly"
+                }
+            trade_query = trade_query.filter(Trade.market_id.in_(market_ids))
+
+        trades = trade_query.order_by(Trade.timestamp).all()
+        valid_trades = [
+            trade for trade in trades
+            if trade.value is not None and trade.value > 0 and trade.timestamp is not None
+        ]
+        values = [trade.value for trade in valid_trades]
+        winsorized = _winsorize(values, TRADE_WINSOR_PCT, TRADE_WINSOR_PCT)
+        threshold, method = _retail_threshold(
+            winsorized,
+            category_norm if category_norm != "all" else None
+        ) if values else (None, None)
+
+        buckets = {}
+        for trade in valid_trades:
+            hour_key = trade.timestamp.replace(minute=0, second=0, microsecond=0)
+            if hour_key < start_hour or hour_key > end_hour:
+                continue
+            bucket = buckets.setdefault(
+                hour_key,
+                {
+                    "values": [],
+                    "total_trades": 0,
+                    "total_volume": 0.0,
+                    "retail_trades": 0,
+                    "retail_volume": 0.0
+                }
+            )
+            bucket["values"].append(trade.value)
+            bucket["total_trades"] += 1
+            bucket["total_volume"] += trade.value
+            if threshold is not None and trade.value <= threshold:
+                bucket["retail_trades"] += 1
+                bucket["retail_volume"] += trade.value
+
+        cursor = start_hour
+        while cursor <= end_hour:
+            buckets.setdefault(
+                cursor,
+                {
+                    "values": [],
+                    "total_trades": 0,
+                    "total_volume": 0.0,
+                    "retail_trades": 0,
+                    "retail_volume": 0.0
+                }
+            )
+            cursor += timedelta(hours=1)
+
+        volumes = [bucket["total_volume"] for bucket in buckets.values()]
+        mean_volume = sum(volumes) / len(volumes) if volumes else 0
+
+        series = []
+        for hour_key in sorted(buckets.keys()):
+            bucket = buckets[hour_key]
+            total_trades = bucket["total_trades"]
+            total_volume = bucket["total_volume"]
+            retail_trade_share = (bucket["retail_trades"] / total_trades) if total_trades else None
+            retail_volume_share = (bucket["retail_volume"] / total_volume) if total_volume else None
+            avg_trade_size = (total_volume / total_trades) if total_trades else None
+            whale_share, _ = _whale_share(bucket["values"]) if bucket["values"] else (None, 0)
+            burstiness = (total_volume / mean_volume) if mean_volume > 0 else 0
+            flow_score = min(1.0, (retail_trade_share or 0) / 0.6) if retail_trade_share is not None else None
+            attention_score = (
+                min(1.0, max(burstiness - 1.0, 0.0) / 1.5)
+                if total_trades
+                else None
+            )
+            retail_score = round((flow_score or 0) * 10, 2) if total_trades else None
+
+            series.append({
+                "timestamp": _to_utc_iso(hour_key),
+                "retail_score": retail_score,
+                "retail_level": None,
+                "flow_score": flow_score,
+                "attention_score": attention_score,
+                "retail_trade_share": retail_trade_share,
+                "retail_volume_share": retail_volume_share,
+                "avg_trade_size": avg_trade_size,
+                "total_trades": total_trades,
+                "total_volume": total_volume,
+                "whale_share": whale_share,
+                "whale_dominated": whale_share >= 0.5 if whale_share is not None else False,
+                "confidence_label": _confidence_label(total_trades),
+                "confidence_score": _confidence_score(total_trades),
+                "trade_threshold": threshold,
+                "trade_threshold_method": method
+            })
+
+        summary = {}
+        if series:
+            latest = next((row for row in reversed(series) if row["total_trades"] > 0), series[-1])
+            summary = {
+                "latest_date": latest["timestamp"],
+                "latest_retail_score": latest["retail_score"],
+                "latest_flow_score": latest["flow_score"],
+                "latest_attention_score": latest["attention_score"],
+                "latest_retail_trade_share": latest["retail_trade_share"],
+                "latest_retail_volume_share": latest["retail_volume_share"],
+                "latest_whale_share": latest["whale_share"],
+                "latest_total_trades": latest["total_trades"],
+                "latest_total_volume": latest["total_volume"],
+                "confidence_label": latest["confidence_label"]
+            }
+
+        return {
+            "category": category_norm,
+            "hours": hours,
+            "series": series,
+            "summary": summary,
+            "granularity": "hourly"
         }
     finally:
         db.close()
