@@ -208,6 +208,31 @@ def _canonical_market_id(market: Market) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", title).strip("-")
     return slug or str(market.id)
 
+def _rank_reliable(
+    coverage: str | None,
+    quality_ok: bool | None,
+    sample_trades: int | None,
+    trade_count_window: int | None,
+    volume_24h: float | None,
+    liquidity: float | None,
+    min_trades: int = RETAIL_MIN_TRADES,
+    min_volume: float = MIN_MARKET_VOLUME_24H,
+    min_liquidity: float = MIN_MARKET_LIQUIDITY
+) -> bool:
+    if coverage != "trade":
+        return False
+    if not quality_ok:
+        return False
+    if (sample_trades or 0) < min_trades:
+        return False
+    if (trade_count_window or 0) < min_trades:
+        return False
+    if (volume_24h or 0) < min_volume:
+        return False
+    if (liquidity or 0) < min_liquidity:
+        return False
+    return True
+
 def _whale_share(values: List[float]) -> tuple[float, int]:
     if not values:
         return 0.0, 0
@@ -805,13 +830,19 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30, h
                 row["retail_signals"]["sample_trades"] = len(trades)
             row["retail_signals"]["quality_ok"] = row.get("quality_ok", False)
             row["retail_signals"]["quality_reason"] = row.get("quality_reason")
+            row["retail_signals"]["rank_reliable"] = _rank_reliable(
+                row["retail_signals"].get("coverage"),
+                row["retail_signals"].get("quality_ok"),
+                row["retail_signals"].get("sample_trades"),
+                row.get("trade_count_window"),
+                row.get("volume_24h"),
+                row.get("liquidity")
+            )
 
         scores_by_category = {}
         for row in rows:
             signals = row.get("retail_signals") or {}
-            if signals.get("coverage") != "trade":
-                continue
-            if not row.get("quality_ok"):
+            if not signals.get("rank_reliable"):
                 continue
             score = signals.get("score")
             if score is None:
@@ -831,7 +862,7 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30, h
             signals = row.get("retail_signals") or {}
             score = signals.get("score")
             mean_std = stats_by_category.get(row["category"])
-            if score is None or not mean_std or mean_std[1] == 0:
+            if (not signals.get("rank_reliable")) or score is None or not mean_std or mean_std[1] == 0:
                 row["retail_score_z"] = None
             else:
                 row["retail_score_z"] = (score - mean_std[0]) / mean_std[1]
@@ -896,20 +927,29 @@ def get_market_detail(market_id: str, hours: int = 24):
             .all()
 
         if len(trades) >= RETAIL_MIN_TRADES and quality_ok:
-            retail_signals = _compute_retail_signals(trades, _normalize_category(market.category))
-        else:
-            recent_snapshots = [s for s in snapshots if s.timestamp >= since]
-            retail_signals = _compute_snapshot_signals(recent_snapshots or snapshots[-24:])
-            retail_signals["coverage"] = "insufficient"
-            retail_signals["sample_trades"] = len(trades)
-        retail_signals["quality_ok"] = quality_ok
-        retail_signals["quality_reason"] = quality_reason
-        lifecycle = _compute_lifecycle(snapshots[-60:])
+        retail_signals = _compute_retail_signals(trades, _normalize_category(market.category))
+    else:
+        recent_snapshots = [s for s in snapshots if s.timestamp >= since]
+        retail_signals = _compute_snapshot_signals(recent_snapshots or snapshots[-24:])
+        retail_signals["coverage"] = "insufficient"
+        retail_signals["sample_trades"] = len(trades)
+    retail_signals["quality_ok"] = quality_ok
+    retail_signals["quality_reason"] = quality_reason
+    lifecycle = _compute_lifecycle(snapshots[-60:])
 
-        return {
-            "market": {
-                "id": market.id,
-                "canonical_id": _canonical_market_id(market),
+    retail_signals["rank_reliable"] = _rank_reliable(
+        retail_signals.get("coverage"),
+        retail_signals.get("quality_ok"),
+        retail_signals.get("sample_trades"),
+        trade_count,
+        latest.volume_24h if latest else None,
+        latest.liquidity if latest else None
+    )
+
+    return {
+        "market": {
+            "id": market.id,
+            "canonical_id": _canonical_market_id(market),
                 "title": market.title,
                 "category": _normalize_category(market.category),
                 "subcategory": market.subcategory,

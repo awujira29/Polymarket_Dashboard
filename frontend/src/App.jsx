@@ -464,6 +464,12 @@ export default function App() {
     return `Whale dominated (${formatPercent(whaleShare)} of volume)`;
   }, [marketDetail]);
 
+  const reliabilityNote = useMemo(() => {
+    const signals = marketDetail?.retail_signals;
+    if (!signals || signals.rank_reliable !== false) return '';
+    return 'Retail ranking not reliable (insufficient trades, volume, or liquidity).';
+  }, [marketDetail]);
+
   const selectedMarketRow = useMemo(() => {
     if (!selectedMarketId) return null;
     return markets.find((market) => market.id === selectedMarketId) || null;
@@ -661,6 +667,7 @@ export default function App() {
             {filteredMarkets.map((market) => {
               const retailStatus = resolveRetailStatus(market.retail_signals);
               const marketClosed = isMarketClosed(market);
+              const rankReliable = market.retail_signals?.rank_reliable;
               return (
               <button
                 key={market.id}
@@ -673,6 +680,7 @@ export default function App() {
                     <span className="category-dot" style={{ backgroundColor: getCategoryColor(market.category) }} />
                     <span>{market.category}</span>
                     {marketClosed && <span className="status-pill closed">Closed</span>}
+                    {rankReliable === false && <span className="status-pill caution">Rank caution</span>}
                     <span>•</span>
                     <span>{formatTimestamp(market.last_updated)}</span>
                     <span>•</span>
@@ -747,6 +755,11 @@ export default function App() {
                       marketDetail.retail_signals.sample_trades
                     )}
                   </span>
+                  {typeof marketDetail.retail_signals.rank_reliable === 'boolean' && (
+                    <span className={`status-pill ${marketDetail.retail_signals.rank_reliable ? 'reliable' : 'caution'}`}>
+                      {marketDetail.retail_signals.rank_reliable ? 'Rank reliable' : 'Rank caution'}
+                    </span>
+                  )}
                   {detailIsClosed && <span className="status-pill closed">Closed</span>}
                   {detailConfidenceLabel && <span className="hint">{detailConfidenceLabel}</span>}
                 </div>
@@ -790,6 +803,9 @@ export default function App() {
               )}
               {whaleNote && (
                 <div className="coverage-note warning">{whaleNote}</div>
+              )}
+              {reliabilityNote && (
+                <div className="coverage-note warning">{reliabilityNote}</div>
               )}
 
               <div className="signal-grid">
