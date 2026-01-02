@@ -25,7 +25,16 @@ import {
 } from 'lucide-react';
 import './App.css';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = (() => {
+  const envBase = (import.meta.env.VITE_API_BASE || '').trim();
+  if (envBase) {
+    return envBase.replace(/\/+$/, '');
+  }
+  if (typeof window !== 'undefined' && window.location && window.location.origin) {
+    return window.location.origin;
+  }
+  return '';
+})();
 
 const formatCurrency = (value) => {
   if (value === null || value === undefined) return '--';
