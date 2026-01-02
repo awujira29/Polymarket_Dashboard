@@ -17,6 +17,12 @@ A research and monitoring system for retail trading patterns in prediction marke
 - **Database**: SQLite by default, configurable via `DATABASE_URL`
 - **Frontend**: React app that consumes the API
 
+## Live Deployment
+
+- Frontend (Vercel): https://polymarket-dashboard-e79w.vercel.app  
+- Backend API (Render): https://polymarket-dashboard-341m.onrender.com  
+- The frontend is built with `VITE_API_BASE` pointing to the Render API URL. If you redeploy the frontend, keep that env var set (no trailing slash).
+
 ## Requirements
 
 - Python 3.10+
