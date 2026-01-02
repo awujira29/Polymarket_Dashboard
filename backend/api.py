@@ -38,6 +38,12 @@ app.add_middleware(
 # Initialize retail analyzer
 retail_analyzer = RetailBehaviorAnalyzer()
 
+MAX_MARKET_DAYS = 14
+MAX_ANALYTICS_DAYS = 90
+MAX_HISTORY_HOURS = 240
+MAX_TRADES_LIMIT = 500
+MAX_HOURLY_RETAIL_HOURS = 168
+
 @app.get("/")
 def root():
     """API health check"""
@@ -133,6 +139,13 @@ def _status_label(market, closed_flag: bool) -> str:
             return status
         return "closed"
     return status or "active"
+
+def _clamp_int(value: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 def _tracked_categories_set() -> set[str]:
     if not TRACKED_CATEGORIES:
@@ -607,6 +620,7 @@ def _bucket_trade_sizes(trades: List[Trade]) -> List[Dict]:
 @app.get("/overview")
 def get_overview(days: int = 14):
     """High-level overview for the Polymarket-only retail dashboard."""
+    days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
     db = get_db_session()
 
     try:
@@ -786,6 +800,8 @@ def get_overview(days: int = 14):
 @app.get("/markets")
 def list_markets(category: str | None = None, limit: int = 25, days: int = 14, hide_whales: bool = False):
     """List markets with latest stats and retail signals."""
+    days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
+    limit = _clamp_int(limit, minimum=1, maximum=100)
     db = get_db_session()
 
     try:
@@ -948,6 +964,7 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 14, h
 @app.get("/markets/{market_id}")
 def get_market_detail(market_id: str, hours: int = 24):
     """Detailed market view with retail signals and lifecycle analysis."""
+    hours = _clamp_int(hours, minimum=1, maximum=MAX_HISTORY_HOURS)
     db = get_db_session()
 
     try:
@@ -1046,6 +1063,7 @@ def get_market_detail(market_id: str, hours: int = 24):
 @app.get("/markets/{market_id}/history")
 def get_market_history(market_id: str, hours: int = 168):
     """Time series of market snapshots for charting."""
+    hours = _clamp_int(hours, minimum=1, maximum=MAX_HISTORY_HOURS)
     db = get_db_session()
 
     try:
@@ -1171,6 +1189,8 @@ def get_markets_by_category(category: str, limit: int = 20):
 @app.get("/markets/{market_id}/trades")
 def get_market_trades(market_id: str, hours: int = 24, limit: int = 1000):
     """Get trade data for a market with retail analysis"""
+    hours = _clamp_int(hours, minimum=1, maximum=MAX_HISTORY_HOURS)
+    limit = _clamp_int(limit, minimum=1, maximum=MAX_TRADES_LIMIT)
     db = get_db_session()
 
     try:
@@ -1334,6 +1354,7 @@ def get_retail_dashboard():
 @app.get("/retail/time-series/{category}")
 def get_retail_time_series(category: str, hours: int = 24):
     """Get time-series retail behavior data for a category"""
+    hours = _clamp_int(hours, minimum=1, maximum=MAX_HISTORY_HOURS)
     db = get_db_session()
 
     try:
@@ -1658,6 +1679,7 @@ def get_analytics_overview():
 @app.get("/analytics/retail-index")
 def get_retail_index(days: int = 180, category: str = "all"):
     """Long-term retail index rollups."""
+    days = _clamp_int(days, minimum=1, maximum=MAX_ANALYTICS_DAYS)
     db = get_db_session()
 
     try:
@@ -1727,6 +1749,7 @@ def get_retail_index(days: int = 180, category: str = "all"):
 @app.get("/analytics/retail-index/hourly")
 def get_retail_index_hourly(hours: int = 72, category: str = "all"):
     """Short-term retail index rollups (hourly)."""
+    hours = _clamp_int(hours, minimum=1, maximum=MAX_HOURLY_RETAIL_HOURS)
     db = get_db_session()
 
     try:
