@@ -605,7 +605,7 @@ def _bucket_trade_sizes(trades: List[Trade]) -> List[Dict]:
     ]
 
 @app.get("/overview")
-def get_overview(days: int = 30):
+def get_overview(days: int = 14):
     """High-level overview for the Polymarket-only retail dashboard."""
     db = get_db_session()
 
@@ -784,7 +784,7 @@ def get_overview(days: int = 30):
         db.close()
 
 @app.get("/markets")
-def list_markets(category: str | None = None, limit: int = 25, days: int = 30, hide_whales: bool = False):
+def list_markets(category: str | None = None, limit: int = 25, days: int = 14, hide_whales: bool = False):
     """List markets with latest stats and retail signals."""
     db = get_db_session()
 
