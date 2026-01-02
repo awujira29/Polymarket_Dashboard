@@ -1,0 +1,17 @@
+INFO:     Will watch for changes in these directories: ['/Users/ada/Desktop/prediction-market-dashboard/backend']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [42892] using WatchFiles
+WARNING:root:ML libraries not available. Using basic statistical analysis only.
+INFO:     Started server process [42902]
+INFO:     Waiting for application startup.
+INFO:database:Creating database tables...
+INFO:database:Database tables created successfully!
+INFO:     Application startup complete.
+INFO:     127.0.0.1:51144 - "GET /analytics/retail-index?category=all&days=180 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51126 - "GET /overview HTTP/1.1" 200 OK
+INFO:     192.168.1.1:50784 - "GET / HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [42902]
+INFO:     Stopping reloader process [42892]

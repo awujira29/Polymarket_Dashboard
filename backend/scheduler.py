@@ -95,6 +95,24 @@ class ContinuousDataCollector:
                 # Store market data and snapshots
                 for category, markets in data['categories'].items():
                     for market_data in markets:
+                        is_closed = self.collector._bool_flag(market_data.get('closed', False))
+                        is_archived = self.collector._bool_flag(market_data.get('archived', False))
+                        is_active = market_data.get('active', True)
+                        raw_status = str(market_data.get('status') or "").strip().lower()
+                        if raw_status:
+                            status_label = raw_status
+                        elif is_closed:
+                            status_label = 'closed'
+                        elif is_active:
+                            status_label = 'active'
+                        else:
+                            status_label = 'inactive'
+                        end_date_iso = (
+                            market_data.get('endDateIso')
+                            or market_data.get('end_date')
+                            or market_data.get('endDate')
+                        )
+
                         # Check if market exists
                         market = session.query(Market).filter_by(id=market_data['id']).first()
                         if not market:
@@ -107,14 +125,21 @@ class ContinuousDataCollector:
                                 event_title=market_data['event_title'],
                                 event_tags=market_data['event_tags'],
                                 outcomes=market_data['outcomes'],
-                                status='active' if market_data['active'] else 'inactive',
-                                closed='true' if market_data['closed'] else 'false'
+                                status=status_label,
+                                closed='true' if is_closed else 'false',
+                                archived='true' if is_archived else 'false',
+                                end_date_iso=end_date_iso
                             )
                             session.add(market)
                         else:
                             # Update existing market
                             market.category = category
                             market.event_tags = market_data['event_tags']
+                            market.status = status_label
+                            market.closed = 'true' if is_closed else 'false'
+                            market.archived = 'true' if is_archived else 'false'
+                            if end_date_iso:
+                                market.end_date_iso = end_date_iso
                             if market_data.get('condition_id') and not market.condition_id:
                                 market.condition_id = market_data.get('condition_id')
 

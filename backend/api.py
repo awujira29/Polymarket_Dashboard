@@ -62,6 +62,18 @@ def _normalize_category(value: str | None) -> str:
         return "uncategorized"
     return str(value).strip().lower()
 
+_CLOSED_STATUS_VALUES = {
+    "closed",
+    "inactive",
+    "resolved",
+    "settled",
+    "void",
+    "voided",
+    "cancelled",
+    "canceled",
+    "ended"
+}
+
 def _truthy_flag(value) -> bool:
     if value is None:
         return False
@@ -72,6 +84,55 @@ def _truthy_flag(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
     return False
+
+def _parse_date(value):
+    """Best-effort parse of date/datetime strings into a naive UTC datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is None else value.astimezone(timezone.utc).replace(tzinfo=None)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+        except (OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+    return None
+
+def _is_closed_market(market, latest_snapshot=None) -> bool:
+    """Derive a closed flag using multiple cues to avoid stale 'active' states."""
+    if not market:
+        return False
+    if _truthy_flag(getattr(market, "closed", None)) or _truthy_flag(getattr(market, "archived", None)):
+        return True
+    status = str(market.status or "").strip().lower()
+    if status in _CLOSED_STATUS_VALUES:
+        return True
+    end_date = _parse_date(getattr(market, "end_date", None) or getattr(market, "end_date_iso", None))
+    if end_date and datetime.utcnow() >= end_date:
+        return True
+    return False
+
+def _status_label(market, closed_flag: bool) -> str:
+    """Normalize status, defaulting to closed when the derived flag is set."""
+    status = str(getattr(market, "status", "") or "").strip().lower()
+    if closed_flag:
+        if status in _CLOSED_STATUS_VALUES:
+            return status
+        return "closed"
+    return status or "active"
 
 def _tracked_categories_set() -> set[str]:
     if not TRACKED_CATEGORIES:
@@ -745,6 +806,8 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30, h
                       .filter_by(market_id=market.id)
                       .order_by(desc(MarketSnapshot.timestamp))
                       .first())
+            closed_flag = _is_closed_market(market, latest)
+            status_label = _status_label(market, closed_flag)
             if not latest:
                 continue
             quality_ok, quality_reason = _market_quality_ok(latest.volume_24h, latest.liquidity)
@@ -770,9 +833,9 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 30, h
                 "category": _normalize_category(market.category),
                 "description": market.description,
                 "end_date": market.end_date_iso,
-                "closed": _truthy_flag(market.closed),
+                "closed": closed_flag,
                 "archived": _truthy_flag(market.archived),
-                "status": market.status,
+                "status": status_label,
                 "price": latest.price,
                 "volume_24h": latest.volume_24h,
                 "liquidity": latest.liquidity,
@@ -920,6 +983,8 @@ def get_market_detail(market_id: str, hours: int = 24):
             latest.volume_24h if latest else None,
             latest.liquidity if latest else None
         )
+        closed_flag = _is_closed_market(market, latest)
+        status_label = _status_label(market, closed_flag)
 
         snapshots = db.query(MarketSnapshot)\
             .filter_by(market_id=market_id)\
@@ -927,37 +992,37 @@ def get_market_detail(market_id: str, hours: int = 24):
             .all()
 
         if len(trades) >= RETAIL_MIN_TRADES and quality_ok:
-        retail_signals = _compute_retail_signals(trades, _normalize_category(market.category))
-    else:
-        recent_snapshots = [s for s in snapshots if s.timestamp >= since]
-        retail_signals = _compute_snapshot_signals(recent_snapshots or snapshots[-24:])
-        retail_signals["coverage"] = "insufficient"
-        retail_signals["sample_trades"] = len(trades)
-    retail_signals["quality_ok"] = quality_ok
-    retail_signals["quality_reason"] = quality_reason
-    lifecycle = _compute_lifecycle(snapshots[-60:])
+            retail_signals = _compute_retail_signals(trades, _normalize_category(market.category))
+        else:
+            recent_snapshots = [s for s in snapshots if s.timestamp >= since]
+            retail_signals = _compute_snapshot_signals(recent_snapshots or snapshots[-24:])
+            retail_signals["coverage"] = "insufficient"
+            retail_signals["sample_trades"] = len(trades)
+        retail_signals["quality_ok"] = quality_ok
+        retail_signals["quality_reason"] = quality_reason
+        lifecycle = _compute_lifecycle(snapshots[-60:])
 
-    retail_signals["rank_reliable"] = _rank_reliable(
-        retail_signals.get("coverage"),
-        retail_signals.get("quality_ok"),
-        retail_signals.get("sample_trades"),
-        trade_count,
-        latest.volume_24h if latest else None,
-        latest.liquidity if latest else None
-    )
+        retail_signals["rank_reliable"] = _rank_reliable(
+            retail_signals.get("coverage"),
+            retail_signals.get("quality_ok"),
+            retail_signals.get("sample_trades"),
+            trade_count,
+            latest.volume_24h if latest else None,
+            latest.liquidity if latest else None
+        )
 
-    return {
-        "market": {
-            "id": market.id,
+        return {
+            "market": {
+                "id": market.id,
             "canonical_id": _canonical_market_id(market),
                 "title": market.title,
                 "category": _normalize_category(market.category),
                 "subcategory": market.subcategory,
                 "description": market.description,
                 "end_date": market.end_date_iso,
-                "closed": _truthy_flag(market.closed),
+                "closed": closed_flag,
                 "archived": _truthy_flag(market.archived),
-                "status": market.status,
+                "status": status_label,
                 "event_title": market.event_title,
                 "event_tags": market.event_tags,
                 "outcomes": market.outcomes

@@ -122,6 +122,18 @@ class PolymarketCollector:
                 return default
         return default
 
+    def _bool_flag(self, value) -> bool:
+        """Normalize various truthy inputs (bool/int/str) to a boolean."""
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "y"}
+        return False
+
     def _utc_now(self) -> datetime:
         return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -668,6 +680,23 @@ class PolymarketCollector:
                     "Unknown Market")
 
             category = str(market_data.get("category", "other")).strip().lower()
+            closed_flag = self._bool_flag(market_data.get("closed", False))
+            archived_flag = self._bool_flag(market_data.get("archived", False))
+            active_flag = market_data.get("active")
+            raw_status = str(market_data.get("status") or "").strip().lower()
+            if raw_status:
+                status_label = raw_status
+            elif closed_flag:
+                status_label = "closed"
+            elif active_flag is False:
+                status_label = "inactive"
+            else:
+                status_label = "active"
+            end_date_iso = (
+                market_data.get("endDateIso")
+                or market_data.get("end_date")
+                or market_data.get("endDate")
+            )
             
             # Check if market exists
             existing = db_session.query(Market).filter_by(id=market_id).first()
@@ -676,10 +705,11 @@ class PolymarketCollector:
                 # Update existing
                 existing.title = title
                 existing.description = market_data.get("description", "")
-                existing.status = "active"
-                existing.closed = str(market_data.get("closed", False)).lower()
-                existing.archived = str(market_data.get("archived", False)).lower()
-                existing.end_date_iso = market_data.get("endDateIso")
+                existing.status = status_label
+                existing.closed = str(closed_flag).lower()
+                existing.archived = str(archived_flag).lower()
+                if end_date_iso:
+                    existing.end_date_iso = end_date_iso
                 existing.subcategory = market_data.get("subcategory")
                 existing.condition_id = market_data.get("condition_id") or market_data.get("conditionId")
                 existing.event_title = market_data.get("event_title")
@@ -695,10 +725,10 @@ class PolymarketCollector:
                     category=category,
                     subcategory=market_data.get("subcategory"),
                     description=market_data.get("description", ""),
-                    status="active",
-                    closed=str(market_data.get("closed", False)).lower(),
-                    archived=str(market_data.get("archived", False)).lower(),
-                    end_date_iso=market_data.get("endDateIso"),
+                    status=status_label,
+                    closed=str(closed_flag).lower(),
+                    archived=str(archived_flag).lower(),
+                    end_date_iso=end_date_iso,
                     event_title=market_data.get("event_title"),
                     event_tags=market_data.get("event_tags"),
                     outcomes=market_data.get("outcomes")
