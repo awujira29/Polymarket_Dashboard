@@ -75,11 +75,6 @@ def _ensure_indexes():
             "ON trades (market_id, timestamp DESC)"
         ),
         (
-            "idx_trades_timestamp",
-            "CREATE INDEX IF NOT EXISTS idx_trades_timestamp "
-            "ON trades (timestamp)"
-        ),
-        (
             "idx_snapshots_market_timestamp",
             "CREATE INDEX IF NOT EXISTS idx_snapshots_market_timestamp "
             "ON market_snapshots (market_id, timestamp DESC)"
