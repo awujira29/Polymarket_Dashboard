@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 from math import sqrt
 import re
+import time
+import logging
 from config import (
     TRACKED_CATEGORIES,
     RETAIL_SIZE_PERCENTILES,
@@ -21,6 +23,7 @@ from config import (
 )
 
 app = FastAPI(title="Prediction Market Retail Behavior API")
+logger = logging.getLogger("api")
 
 @app.on_event("startup")
 def startup_db():
@@ -43,6 +46,9 @@ MAX_ANALYTICS_DAYS = 90
 MAX_HISTORY_HOURS = 240
 MAX_TRADES_LIMIT = 500
 MAX_HOURLY_RETAIL_HOURS = 168
+
+_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_TTL_SECONDS = 120
 
 @app.get("/")
 def root():
@@ -146,6 +152,19 @@ def _clamp_int(value: int, *, minimum: int | None = None, maximum: int | None = 
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+def _cache_get(key: str):
+    entry = _CACHE.get(key)
+    if not entry:
+        return None
+    ts, value = entry
+    if (time.time() - ts) > _CACHE_TTL_SECONDS:
+        _CACHE.pop(key, None)
+        return None
+    return value
+
+def _cache_set(key: str, value) -> None:
+    _CACHE[key] = (time.time(), value)
 
 def _tracked_categories_set() -> set[str]:
     if not TRACKED_CATEGORIES:
@@ -618,9 +637,15 @@ def _bucket_trade_sizes(trades: List[Trade]) -> List[Dict]:
     ]
 
 @app.get("/overview")
-def get_overview(days: int = 14):
+def get_overview(days: int = 7):
     """High-level overview for the Polymarket-only retail dashboard."""
     days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
+    cache_key = f"overview:{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    start_time = time.time()
     db = get_db_session()
 
     try:
@@ -779,7 +804,7 @@ def get_overview(days: int = 14):
             key=lambda x: x["avg_trade_size"]
         )[:8]
 
-        return {
+        result = {
             "timestamp": _to_utc_iso(datetime.utcnow()),
             "last_collection": _to_utc_iso(latest_run.timestamp) if latest_run else None,
             "window_days": days,
@@ -794,14 +819,25 @@ def get_overview(days: int = 14):
             "top_volume_markets": top_volume,
             "top_retail_markets": top_retail
         }
+        return result
     finally:
         db.close()
+        duration = time.time() - start_time
+        logger.info("overview duration=%.2fs days=%s", duration, days)
+        if "result" in locals():
+            _cache_set(cache_key, locals()["result"])
 
 @app.get("/markets")
-def list_markets(category: str | None = None, limit: int = 25, days: int = 14, hide_whales: bool = False):
+def list_markets(category: str | None = None, limit: int = 50, days: int = 7, hide_whales: bool = False):
     """List markets with latest stats and retail signals."""
     days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
     limit = _clamp_int(limit, minimum=1, maximum=100)
+    cache_key = f"markets:{category or 'all'}:{limit}:{days}:{int(hide_whales)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    start_time = time.time()
     db = get_db_session()
 
     try:
@@ -954,12 +990,16 @@ def list_markets(category: str | None = None, limit: int = 25, days: int = 14, h
 
         rows = rows[:limit]
 
-        return {
+        result = {
             "total": len(rows),
             "markets": rows
         }
     finally:
         db.close()
+        duration = time.time() - start_time
+        logger.info("markets duration=%.2fs days=%s limit=%s cached=%s", duration, days, limit, cached is not None)
+        if "result" in locals():
+            _cache_set(cache_key, locals()["result"])
 
 @app.get("/markets/{market_id}")
 def get_market_detail(market_id: str, hours: int = 24):
