@@ -53,12 +53,13 @@ MAX_HISTORY_HOURS = 240
 MAX_TRADES_LIMIT = 300
 MAX_HOURLY_RETAIL_HOURS = 168
 
-DEFAULT_MARKET_DAYS = 5
+DEFAULT_MARKET_DAYS = 3
 DEFAULT_MARKET_LIMIT = 25
-DEFAULT_OVERVIEW_DAYS = 5
+DEFAULT_OVERVIEW_DAYS = 3
 
 _CACHE: dict[str, tuple[float, object]] = {}
-_CACHE_TTL_SECONDS = 300
+_CACHE_LAST: dict[str, object] = {}
+_CACHE_TTL_SECONDS = 600
 _CACHE_WARM_INTERVAL = 180
 
 @app.get("/")
@@ -176,6 +177,7 @@ def _cache_get(key: str):
 
 def _cache_set(key: str, value) -> None:
     _CACHE[key] = (time.time(), value)
+    _CACHE_LAST[key] = value
 
 def _cache_warmer_loop():
     while True:
@@ -667,6 +669,7 @@ def get_overview(days: int = DEFAULT_OVERVIEW_DAYS, response: Response = None):
         if response is not None:
             response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
         return cached
+    stale = _CACHE_LAST.get(cache_key)
 
     start_time = time.time()
     db = get_db_session()
@@ -845,6 +848,14 @@ def get_overview(days: int = DEFAULT_OVERVIEW_DAYS, response: Response = None):
         if response is not None:
             response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
         return result
+    except Exception as exc:
+        logger.warning("overview failed days=%s error=%s", days, exc)
+        if stale is not None:
+            if response is not None:
+                response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
+                response.headers["X-Cache"] = "stale"
+            return stale
+        raise
     finally:
         db.close()
         duration = time.time() - start_time
@@ -1021,6 +1032,14 @@ def list_markets(category: str | None = None, limit: int = DEFAULT_MARKET_LIMIT,
             "total": len(rows),
             "markets": rows
         }
+    except Exception as exc:
+        logger.warning("markets failed days=%s limit=%s error=%s", days, limit, exc)
+        if stale is not None:
+            if response is not None:
+                response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
+                response.headers["X-Cache"] = "stale"
+            return stale
+        raise
     finally:
         db.close()
         duration = time.time() - start_time
