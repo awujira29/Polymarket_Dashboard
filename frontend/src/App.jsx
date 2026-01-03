@@ -193,7 +193,16 @@ export default function App() {
     if (!response.ok) {
       throw new Error(`Request failed: ${response.status}`);
     }
-    return response.json();
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (err) {
+      throw new Error('Empty response body');
+    }
+    if (data === null || data === undefined) {
+      throw new Error('Empty response body');
+    }
+    return data;
   };
 
   const loadOverview = async (days = windowDays) => {
@@ -207,14 +216,15 @@ export default function App() {
     if (category && category !== 'all') {
       params.set('category', category);
     }
-    params.set('limit', '50');
+    params.set('limit', '25');
     params.set('days', String(days));
     if (hideWhales) {
       params.set('hide_whales', 'true');
     }
     const data = await fetchJson(`${API_BASE}/markets?${params.toString()}`);
-    setMarkets(data.markets || []);
-    if (selectedMarketId && !(data.markets || []).some((m) => m.id === selectedMarketId)) {
+    const list = Array.isArray(data?.markets) ? data.markets : [];
+    setMarkets(list);
+    if (selectedMarketId && !list.some((m) => m.id === selectedMarketId)) {
       setSelectedMarketId(null);
       setMarketDetail(null);
       setMarketHistory([]);
@@ -226,7 +236,7 @@ export default function App() {
     const windowHours = days * 24;
     const detailPromise = fetchJson(`${API_BASE}/markets/${marketId}?hours=${windowHours}`);
     const historyPromise = fetchJson(`${API_BASE}/markets/${marketId}/history?hours=${windowHours}`);
-    const tradesPromise = fetchJson(`${API_BASE}/markets/${marketId}/trades?hours=${windowHours}&limit=500`);
+    const tradesPromise = fetchJson(`${API_BASE}/markets/${marketId}/trades?hours=${windowHours}&limit=300`);
 
     const [detailData, historyData, tradesData] = await Promise.all([
       detailPromise,

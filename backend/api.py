@@ -658,7 +658,7 @@ def _bucket_trade_sizes(trades: List[Trade]) -> List[Dict]:
     ]
 
 @app.get("/overview")
-def get_overview(days: int = DEFAULT_OVERVIEW_DAYS, response: Response | None = None):
+def get_overview(days: int = DEFAULT_OVERVIEW_DAYS, response: Response = None):
     """High-level overview for the Polymarket-only retail dashboard."""
     days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
     cache_key = f"overview:{days}"
@@ -853,7 +853,7 @@ def get_overview(days: int = DEFAULT_OVERVIEW_DAYS, response: Response | None = 
             _cache_set(cache_key, locals()["result"])
 
 @app.get("/markets")
-def list_markets(category: str | None = None, limit: int = DEFAULT_MARKET_LIMIT, days: int = DEFAULT_MARKET_DAYS, hide_whales: bool = False, response: Response | None = None):
+def list_markets(category: str | None = None, limit: int = DEFAULT_MARKET_LIMIT, days: int = DEFAULT_MARKET_DAYS, hide_whales: bool = False, response: Response = None):
     """List markets with latest stats and retail signals."""
     days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
     limit = _clamp_int(limit, minimum=1, maximum=100)
