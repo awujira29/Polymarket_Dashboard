@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import desc, func
 from database import get_db_session, init_db
@@ -10,6 +10,7 @@ from math import sqrt
 import re
 import time
 import logging
+import threading
 from config import (
     TRACKED_CATEGORIES,
     RETAIL_SIZE_PERCENTILES,
@@ -29,6 +30,11 @@ logger = logging.getLogger("api")
 def startup_db():
     init_db()
 
+@app.on_event("startup")
+def start_cache_warmer():
+    t = threading.Thread(target=_cache_warmer_loop, daemon=True)
+    t.start()
+
 # Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
@@ -44,11 +50,16 @@ retail_analyzer = RetailBehaviorAnalyzer()
 MAX_MARKET_DAYS = 14
 MAX_ANALYTICS_DAYS = 90
 MAX_HISTORY_HOURS = 240
-MAX_TRADES_LIMIT = 500
+MAX_TRADES_LIMIT = 300
 MAX_HOURLY_RETAIL_HOURS = 168
 
+DEFAULT_MARKET_DAYS = 5
+DEFAULT_MARKET_LIMIT = 25
+DEFAULT_OVERVIEW_DAYS = 5
+
 _CACHE: dict[str, tuple[float, object]] = {}
-_CACHE_TTL_SECONDS = 120
+_CACHE_TTL_SECONDS = 300
+_CACHE_WARM_INTERVAL = 180
 
 @app.get("/")
 def root():
@@ -165,6 +176,16 @@ def _cache_get(key: str):
 
 def _cache_set(key: str, value) -> None:
     _CACHE[key] = (time.time(), value)
+
+def _cache_warmer_loop():
+    while True:
+        try:
+            get_overview(DEFAULT_OVERVIEW_DAYS)
+            get_overview(MAX_MARKET_DAYS)
+            list_markets(limit=DEFAULT_MARKET_LIMIT, days=DEFAULT_MARKET_DAYS)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("cache warm failed: %s", exc)
+        time.sleep(_CACHE_WARM_INTERVAL)
 
 def _tracked_categories_set() -> set[str]:
     if not TRACKED_CATEGORIES:
@@ -637,12 +658,14 @@ def _bucket_trade_sizes(trades: List[Trade]) -> List[Dict]:
     ]
 
 @app.get("/overview")
-def get_overview(days: int = 7):
+def get_overview(days: int = DEFAULT_OVERVIEW_DAYS, response: Response | None = None):
     """High-level overview for the Polymarket-only retail dashboard."""
     days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
     cache_key = f"overview:{days}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        if response is not None:
+            response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
         return cached
 
     start_time = time.time()
@@ -819,6 +842,8 @@ def get_overview(days: int = 7):
             "top_volume_markets": top_volume,
             "top_retail_markets": top_retail
         }
+        if response is not None:
+            response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
         return result
     finally:
         db.close()
@@ -828,13 +853,15 @@ def get_overview(days: int = 7):
             _cache_set(cache_key, locals()["result"])
 
 @app.get("/markets")
-def list_markets(category: str | None = None, limit: int = 50, days: int = 7, hide_whales: bool = False):
+def list_markets(category: str | None = None, limit: int = DEFAULT_MARKET_LIMIT, days: int = DEFAULT_MARKET_DAYS, hide_whales: bool = False, response: Response | None = None):
     """List markets with latest stats and retail signals."""
     days = _clamp_int(days, minimum=1, maximum=MAX_MARKET_DAYS)
     limit = _clamp_int(limit, minimum=1, maximum=100)
     cache_key = f"markets:{category or 'all'}:{limit}:{days}:{int(hide_whales)}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        if response is not None:
+            response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
         return cached
 
     start_time = time.time()
@@ -1000,6 +1027,9 @@ def list_markets(category: str | None = None, limit: int = 50, days: int = 7, hi
         logger.info("markets duration=%.2fs days=%s limit=%s cached=%s", duration, days, limit, cached is not None)
         if "result" in locals():
             _cache_set(cache_key, locals()["result"])
+    if response is not None:
+        response.headers["Cache-Control"] = f"public, max-age={_CACHE_TTL_SECONDS}"
+    return result
 
 @app.get("/markets/{market_id}")
 def get_market_detail(market_id: str, hours: int = 24):
@@ -1022,7 +1052,7 @@ def get_market_detail(market_id: str, hours: int = 24):
             .filter_by(market_id=market_id)\
             .filter(Trade.timestamp >= since)\
             .order_by(desc(Trade.timestamp))\
-            .limit(500)\
+            .limit(MAX_TRADES_LIMIT)\
             .all()
         trade_count, total_value, last_trade_time = db.query(
             func.count(Trade.id),
@@ -1227,7 +1257,7 @@ def get_markets_by_category(category: str, limit: int = 20):
         db.close()
 
 @app.get("/markets/{market_id}/trades")
-def get_market_trades(market_id: str, hours: int = 24, limit: int = 1000):
+def get_market_trades(market_id: str, hours: int = 24, limit: int = MAX_TRADES_LIMIT):
     """Get trade data for a market with retail analysis"""
     hours = _clamp_int(hours, minimum=1, maximum=MAX_HISTORY_HOURS)
     limit = _clamp_int(limit, minimum=1, maximum=MAX_TRADES_LIMIT)
